@@ -84,16 +84,19 @@ def locate_tile_path(lat_deg: float, lon_deg: float) -> str:
 def get_tile(lat_deg: float, lon_deg: float, dem_dir: str = "data") -> Tile:
     """Tile cacheado que cubre (lat_deg, lon_deg), cargándolo si hace falta."""
     filename = locate_tile_path(lat_deg, lon_deg)
-    if filename in _tile_cache:
-        return _tile_cache[filename]
     path = Path(dem_dir) / filename
+    # clave = ruta completa, no solo el nombre: dem_dir es un parámetro, así
+    # que dos directorios distintos pueden contener el mismo N10W010.hgt.
+    key = str(path.resolve() if path.exists() else path)
+    if key in _tile_cache:
+        return _tile_cache[key]
     if not path.exists():
         raise TileNotFoundError(
             f"no se encontró {filename} en {dem_dir!r} "
             f"(requerido para lat={lat_deg}, lon={lon_deg})"
         )
     tile = load_tile(str(path))
-    _tile_cache[filename] = tile
+    _tile_cache[key] = tile
     return tile
 
 
@@ -131,3 +134,79 @@ def elevation_m(lat_deg: float, lon_deg: float, dem_dir: str = "data") -> float 
     # degenerado: el punto cae casi exacto sobre un nodo void y las demás
     # esquinas válidas tienen peso ~0 -> media simple sin peso
     return sum(v for v, _ in valid) / len(valid)
+
+
+def elevations_m(lat_arr: np.ndarray, lon_arr: np.ndarray,
+                 dem_dir: str = "data") -> np.ndarray:
+    """elevation_m sobre arrays de coordenadas, agrupando por tile.
+
+    Devuelve NaN (el equivalente vectorizado del None escalar) donde las
+    cuatro esquinas de la interpolación son void. Quien llame debe usar
+    np.nanmax, no np.max: un solo NaN envenenaría el máximo del rayo entero.
+
+    Lanza TileNotFoundError si algún punto cae en un tile que no está en
+    dem_dir; el barrido de horizonte trunca antes de llegar a ese caso.
+    """
+    lat_arr = np.asarray(lat_arr, dtype=float)
+    lon_arr = np.asarray(lon_arr, dtype=float)
+    out = np.full(lat_arr.shape, np.nan)
+    if lat_arr.size == 0:
+        return out
+
+    lat_sw_arr = np.floor(lat_arr).astype(np.int64)
+    lon_sw_arr = np.floor(lon_arr).astype(np.int64)
+    for key in np.unique(_tile_key(lat_sw_arr, lon_sw_arr)):
+        lat_sw, lon_sw = _tile_key_decode(key)
+        in_tile = (lat_sw_arr == lat_sw) & (lon_sw_arr == lon_sw)
+        tile = get_tile(lat_sw + 0.5, lon_sw + 0.5, dem_dir)
+        out[in_tile] = _bilinear(tile, lat_arr[in_tile], lon_arr[in_tile])
+    return out
+
+
+def _tile_key(lat_sw: np.ndarray, lon_sw: np.ndarray) -> np.ndarray:
+    """Esquina SO codificada en un único int, para poder usar np.unique 1-D
+    (mucho más rápido que np.unique(axis=0) por rayo)."""
+    return (lat_sw + 90) * 400 + (lon_sw + 180)
+
+
+def _tile_key_decode(key: int) -> tuple[int, int]:
+    lat_sw, lon_sw = divmod(int(key), 400)
+    return lat_sw - 90, lon_sw - 180
+
+
+def _bilinear(tile: Tile, lat_arr: np.ndarray, lon_arr: np.ndarray) -> np.ndarray:
+    """Interpolación bilineal vectorizada dentro de un único tile."""
+    row = tile.n * (tile.lat_sw + 1 - lat_arr)
+    col = tile.n * (lon_arr - tile.lon_sw)
+    row0 = np.clip(np.floor(row), 0, tile.n).astype(np.int64)
+    col0 = np.clip(np.floor(col), 0, tile.n).astype(np.int64)
+    frow = row - row0
+    fcol = col - col0
+    row1 = np.minimum(row0 + 1, tile.n)
+    col1 = np.minimum(col0 + 1, tile.n)
+
+    values = np.stack([
+        tile.array[row0, col0], tile.array[row0, col1],
+        tile.array[row1, col0], tile.array[row1, col1],
+    ]).astype(float)
+    weights = np.stack([
+        (1 - frow) * (1 - fcol), (1 - frow) * fcol,
+        frow * (1 - fcol), frow * fcol,
+    ])
+
+    valid = values != VOID
+    weights = np.where(valid, weights, 0.0)
+    weight_sum = weights.sum(axis=0)
+    result = np.full(lat_arr.shape, np.nan)
+
+    weighted = weight_sum > 0
+    result[weighted] = ((np.where(valid, values, 0.0) * weights).sum(axis=0)[weighted]
+                        / weight_sum[weighted])
+    # degenerado: punto casi exacto sobre un nodo void, las esquinas válidas
+    # tienen peso ~0 -> media simple (mismo criterio que elevation_m escalar)
+    n_valid = valid.sum(axis=0)
+    degenerate = ~weighted & (n_valid > 0)
+    if degenerate.any():
+        result[degenerate] = (np.where(valid, values, 0.0).sum(axis=0)[degenerate]
+                              / n_valid[degenerate])
+    return result

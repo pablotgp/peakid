@@ -196,4 +196,22 @@ Casi siempre es 1, 2 o 3.
     src/peaks/    Overpass, recolocación, filtrado
     src/render/   PNG del perfil del horizonte
 
+## Roles de cada fuente de datos
+
+- DEM: terreno INTERMEDIO (qué tapa la vista) y silueta del horizonte.
+- OSM: posición y altitud OFICIAL de las cimas.
+- La visibilidad de un pico se comprueba contra SU altitud de OSM, no la
+  del DEM. El DEM se consulta solo para el terreno del camino, que sí
+  está bien representado a 30 m.
+- Motivo: SRTM subestima cimas por promediado (medido: La Maroma
+  2065.6 vs 2069 oficial). En agujas estrechas el error es mayor y
+  algunas ni aparecen en la rejilla.
+
+## Pendiente (no implementar aún)
+
+Soportar múltiples fuentes de DEM con resoluciones distintas, con
+prioridad a la más fina. Los Dolomitas tienen LiDAR abierto a 1-2 m
+(Bolzano/Trento) que no sigue el formato de tile 1°x1°. SRTM queda
+como respaldo global.
+
 `geo/` no depende de nadie. Todo lo demás depende de `geo/`.
