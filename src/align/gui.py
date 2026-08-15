@@ -4,8 +4,10 @@ tkinter es stdlib (cero dependencias nuevas) y mantiene TODA la matemática
 en Python: la alternativa web habría duplicado la proyección en JS, dos
 copias de matemática sensible a convenios. Capa fina: la proyección y la
 tira viven en src/align y están testeadas; esta ventana solo dibuja y recoge
-eventos. NO hay detección automática de cresta: segmentar el skyline es el
-objetivo del modelo de la fase 2, no de heurísticas — el juicio del encaje
+eventos. La cresta detectada alimenta el ajuste automático de inclinación y
+giro, y se puede ver encima de la foto con la tecla C — sin eso, un mal
+encaje no distingue "el detector falló" de "los parámetros están mal", que
+son problemas distintos con arreglos distintos. El juicio final del encaje
 lo hace el usuario mirando la tira.
 
 Verificación: la tira y el canvas se pueden volcar a disco con la tecla D
@@ -24,6 +26,7 @@ Controles:
     S                buscar (en el sector marcado, o los 360° si no hay)
     1 .. 5           saltar entre los candidatos de la última búsqueda
     L                mostrar / ocultar los topónimos
+    C                mostrar / ocultar la CRESTA DETECTADA sobre la foto
     D                volcar tira + canvas + estado a ficheros de depuración
     Ctrl+S           guardar JSON y cerrar
     Escape           salir sin guardar
@@ -67,6 +70,8 @@ _SECTOR_MARK = "#ff9500"
 _LABEL_OK = "#ffffff"     # topónimo de pico visible
 _LABEL_UNKNOWN = "#ffc46b"  # sin confirmar, como el ámbar de render/
 _ROI_COLOR = "#00e5c0"    # recuadro que acota el ajuste
+_SKYLINE_COLOR = "#00b0ff"  # cresta DETECTADA: azul, para no confundirla con
+                            # la silueta calculada (roja) ni con el ROI
 _MIN_SKYLINE_COLUMNS = 50  # por debajo, el modo automático no se sostiene
 
 
@@ -142,6 +147,12 @@ class _AlignApp:
         self.skyline_cols = cols[valid]
         self.skyline_rows = rows[valid]
         self.has_skyline = self.skyline_cols.size >= _MIN_SKYLINE_COLUMNS
+        # También las DESCARTADAS: para juzgar el detector hace falta ver
+        # dónde se rindió, no solo dónde acertó. Con la cobertura al 51% de
+        # 141720, mirar únicamente las válidas lo haría parecer impecable.
+        self.skyline_all_cols, self.skyline_all_rows = cols, rows
+        self.skyline_valid = valid
+        self.show_skyline = False
 
         # Topónimos: la validación que de verdad zanja un alineamiento. Ver
         # qué NOMBRE y qué ALTITUD caen sobre cada bulto distingue hipótesis
@@ -321,6 +332,7 @@ class _AlignApp:
         # especificidad, así que guardar no dispara además la búsqueda
         self.root.bind("<s>", self._run_search)
         self.root.bind("<l>", self._toggle_labels)
+        self.root.bind("<c>", self._toggle_skyline)
         # OJO: en Tk un detalle NUMÉRICO en un binding es el número de BOTÓN
         # del ratón, no una tecla. bind("<1>") registra <Button-1>, así que
         # los dígitos no hacían nada Y, peor, cada clic en la foto aplicaba
@@ -545,6 +557,7 @@ class _AlignApp:
             self.profile.azimuths_deg, self.profile.elevations_deg,
             self.params, self.full_w, self.full_h)
         self._draw_silhouette(x_px, y_px, usable)
+        self._draw_skyline()
         self._draw_peak_labels()
         self._draw_roi()
         self._draw_strip(x_px, y_px, usable)
@@ -639,6 +652,50 @@ class _AlignApp:
             return
         self.show_labels = not self.show_labels
         self._draw_peak_labels()
+
+    def _toggle_skyline(self, event=None) -> None:
+        """Tecla C: la cresta DETECTADA sobre la foto.
+
+        Sin esto solo se ve la silueta calculada, y un mal encaje no
+        distingue "el detector se ha ido a las nubes" de "el azimut está a
+        20°". Son dos problemas con arreglos distintos, y el segundo se
+        arregla desde esta ventana mientras que el primero no.
+        """
+        if event is not None and self._typing(event):
+            return
+        self.show_skyline = not self.show_skyline
+        self._draw_skyline()
+        n = int(np.sum(self.skyline_valid))
+        total = len(self.skyline_valid)
+        self.status.config(
+            text=(f"cresta detectada: {n}/{total} columnas válidas "
+                  f"({n / max(total, 1):.0%}); azul = válida, "
+                  f"azul discontinuo = descartada"
+                  if self.show_skyline else "cresta detectada: oculta"))
+
+    def _draw_skyline(self) -> None:
+        """Dibuja la cresta detectada en coordenadas de FOTO, pasadas por la
+        misma transformación de vista que la silueta: así el zoom y el
+        desplazamiento la mueven a la vez que todo lo demás."""
+        self.canvas.delete("cresta")
+        if not self.show_skyline or self.skyline_all_cols.size == 0:
+            return
+        cx, cy = self._to_canvas(self.skyline_all_cols, self.skyline_all_rows)
+        finite = np.isfinite(cx) & np.isfinite(cy)
+        visible = (finite & (cx > -self.cw) & (cx < 2 * self.cw)
+                   & (cy > -self.ch) & (cy < 2 * self.ch))
+        # válidas y descartadas por separado: un tramo continuo de un color
+        # solo puede serlo si todas sus columnas comparten estado
+        for ok in (True, False):
+            trazo = visible & (self.skyline_valid == ok)
+            for start, end in _runs(trazo):
+                points = [c for pair in zip(cx[start:end], cy[start:end])
+                          for c in pair]
+                if len(points) >= 4:
+                    self.canvas.create_line(
+                        *points, tags="cresta", width=2,
+                        fill=_SKYLINE_COLOR,
+                        dash=None if ok else (5, 4))
 
     def _solve_auto(self) -> None:
         """Resuelve en forma cerrada los parámetros en modo automático.

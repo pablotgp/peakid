@@ -1727,6 +1727,49 @@ def test_bindings_numericos_son_teclas_no_botones(tmp_path):
     assert not [b for b in registrados if b.startswith("<Button-")], registrados
 
 
+def test_tecla_c_muestra_la_cresta_detectada(tmp_path):
+    """Sin ver la cresta DETECTADA, un mal encaje no distingue "el detector
+    se fue a las nubes" de "el azimut está a 20°": problemas distintos, con
+    arreglos distintos y solo uno resoluble desde esta ventana."""
+    import tkinter as tk
+
+    from src.align import AlignmentParams
+    from src.align.gui import _AlignApp
+
+    try:
+        tk.Tk().destroy()
+    except tk.TclError:
+        pytest.skip("sin entorno gráfico")
+
+    profile = _perfil_sintetico()
+    params = AlignmentParams(23.7, 55.0, 2.0, 1.0)
+    photo = tmp_path / "sintetica.jpg"
+    Image.fromarray(_foto_desde_perfil(profile, params, 600, 450)).save(
+        photo, quality=90)
+
+    app = _AlignApp(str(photo), profile, 36.7, -4.0, 10.0, params, {}, "cli")
+    try:
+        assert "c" in set(app.root.bind())      # tecla, no botón del ratón
+        assert app.show_skyline is False        # arranca oculta
+
+        def trazos():
+            return app.canvas.find_withtag("cresta")
+
+        assert not trazos()
+        app._toggle_skyline()
+        assert app.show_skyline is True and trazos()
+
+        # sobrevive a un redibujado: si _redraw no la repintara, cualquier
+        # movimiento de slider la haría desaparecer sin que nadie lo pidiera
+        app._redraw()
+        assert trazos()
+
+        app._toggle_skyline()
+        assert app.show_skyline is False and not trazos()
+    finally:
+        app.root.destroy()
+
+
 def test_busqueda_detecta_ambiguedad_con_campo_estrecho():
     """EL FALLO REAL DEL USUARIO (teleobjetivo de Sierra Nevada).
 

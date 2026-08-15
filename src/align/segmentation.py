@@ -200,8 +200,15 @@ def build_model_detector(use_dp: bool = True, model_path: Path = MODEL_PATH,
                 far = np.abs(np.arange(small_h)[:, None] - center[None, :]) > band
                 cost = cost + far * 10.0
 
+            # El tope de salto NO se ata a la banda. Son dos cosas distintas:
+            # la BANDA impide vagar (es lo que mata el salto a las nubes), y
+            # el tope solo suaviza dentro de ella. Atarlos estrangulaba las
+            # paredes verticales: medido en el Picu Urriellu, el salto máximo
+            # se pegaba al tope y un 2.25% de columnas estaban contra él, así
+            # que una pared vertical salía en diagonal. Una aguja exige
+            # seguir a la banda cuando ESTA salta, no frenarla.
             path, margin = best_path(
-                cost, jump_limit=max(4, min(JUMP_LIMIT_PX, band)))
+                cost, jump_limit=max(JUMP_LIMIT_PX, 2 * band))
             rows = path.astype(float)
             valid = (margin >= 0.02) & has_sky
 
