@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "photo": "141721.jpg",
+  "created_utc": "2026-08-15T09:07:17Z",
+  "notes": "primera muestra valida, alineamiento por busqueda automatica validado a ojo, foto sin recorte con EXIF, calima moderada, cables cruzando",
+  "observer": {
+    "lat_deg": 36.748457,
+    "lon_deg": -4.086678,
+    "eye_m": 6.291128319993825,
+    "source": "cli"
+  },
+  "seed": {
+    "azimuth_deg": {
+      "value": 0.0,
+      "source": "default"
+    },
+    "hfov_deg": {
+      "value": 67.38013505195957,
+      "source": "exif"
+    },
+    "pitch_deg": {
+      "value": 0.0,
+      "source": "default"
+    },
+    "roll_deg": {
+      "value": 0.0,
+      "source": "default"
+    }
+  },
+  "alignment": {
+    "azimuth_deg": 15.4,
+    "hfov_deg": 50.5,
+    "pitch_deg": 4.0,
+    "roll_deg": 0.2
+  },
+  "image": {
+    "width_px": 3060,
+    "height_px": 4080,
+    "exif_oriented": true
+  }
+}

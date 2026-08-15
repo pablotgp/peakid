@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "photo": "sierra.jpg",
+  "created_utc": "2026-08-15T09:36:13Z",
+  "notes": "Esta igual está algo regular ",
+  "observer": {
+    "lat_deg": 37.087292,
+    "lon_deg": -3.2901289,
+    "eye_m": 2882.0979599999814,
+    "source": "cli"
+  },
+  "seed": {
+    "azimuth_deg": {
+      "value": 221.25,
+      "source": "default"
+    },
+    "hfov_deg": {
+      "value": 78.48,
+      "source": "exif"
+    },
+    "pitch_deg": {
+      "value": 0.11,
+      "source": "default"
+    },
+    "roll_deg": {
+      "value": -1.24,
+      "source": "default"
+    }
+  },
+  "alignment": {
+    "azimuth_deg": 221.2,
+    "hfov_deg": 74.7,
+    "pitch_deg": 0.45,
+    "roll_deg": -1.4
+  },
+  "image": {
+    "width_px": 9248,
+    "height_px": 6944,
+    "exif_oriented": true
+  }
+}

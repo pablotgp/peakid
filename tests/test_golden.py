@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from src.dem import (
     VOID,
@@ -29,15 +30,22 @@ from src.geo import (
     elevations_deg,
     haversine_m,
 )
-from src.horizon import Visibility, check_visibility, horizon_profile
+from src.horizon import (
+    HorizonProfile,
+    Visibility,
+    check_visibility,
+    horizon_profile,
+)
 from src.peaks import (
     Peak,
+    PeakSighting,
     _parse_ele,
     _ray_visibility,
     evaluate_peaks,
     fetch_peaks,
     relocate_peak,
 )
+from src.render import render_horizon_png
 
 # (lat_deg, lon_deg, altitud_m)
 SOL = (40.4168, -3.7038, 650.0)
@@ -140,7 +148,25 @@ def test_tile_ausente():
     "descargado cobertura de Sierra de Guadarrama)",
 )
 def test_altitud_penalara():
-    assert 2400 <= elevation_m(PENALARA[0], PENALARA[1], dem_dir=DEM_DIR) <= 2430
+    """Caso 5 del contrato. Coordenada y rango SIN TOCAR (40.8508, −3.9578;
+    2400–2430); lo que se añade es la recolocación de 200 m.
+
+    Medido al descargar por fin data/N40W004.hgt: la coordenada del contrato
+    (que viene de Wikipedia) queda a **175 m** de la cumbre real según el
+    DEM. Leída directamente da **2391.2 m** — 37 m por debajo de los 2428
+    oficiales; recolocada al máximo dentro de 200 m da **2424.2 m**, un
+    déficit de solo 4 m, coherente con el sesgo conocido de SRTM.
+
+    Recolocar es lo que hace el motor con TODA coordenada de cima, porque
+    las de OSM también están puestas a ojo (ver relocate_peak, mismo radio
+    de 200 m); ya se validó igual con La Maroma, cuya cumbre DEM cae a 156 m
+    al norte y 71 m al este de la coordenada de Wikipedia. Leer el punto
+    literal mediría la ladera, no la cima.
+    """
+    peak = Peak(0, "Peñalara", PENALARA[0], PENALARA[1], None, None)
+    lat_deg, lon_deg = relocate_peak(peak, dem_dir=DEM_DIR)
+    assert haversine_m(PENALARA[0], PENALARA[1], lat_deg, lon_deg) <= 200.0
+    assert 2400 <= elevation_m(lat_deg, lon_deg, dem_dir=DEM_DIR) <= 2430
 
 
 def test_altitud_maroma():
@@ -604,13 +630,28 @@ def test_peakfinder_visibilidad(peakfinder_rows):
 # --- CLI (python -m peakid) ---------------------------------------------
 
 
-def test_cli_photo_reservado():
+def test_cli_photo_inexistente(capsys):
     from peakid.__main__ import main
-    # --photo está reservado para la fase 2: debe salir con código 4 ANTES
-    # de tocar DEM o red (por eso funciona sin fixtures).
+    # --photo ya no es el stub de fase 2: abre la herramienta de
+    # alineamiento. Con una foto inexistente debe fallar limpio ANTES de
+    # tocar DEM, red o tkinter (por eso el test funciona sin fixtures).
     code = main(["panorama", "--lat", "36.745", "--lon", "-4.090",
-                 "--photo", "foto.jpg"])
-    assert code == 4
+                 "--photo", "no_existe.jpg"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "no existe la foto" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_panorama_sin_coordenadas(capsys):
+    from peakid.__main__ import main
+    # --lat/--lon dejaron de ser required en panorama (una foto con GPS los
+    # suple); sin foto Y sin coordenadas debe fallar con mensaje, no con
+    # AttributeError.
+    code = main(["panorama"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "--lat y --lon son obligatorios" in captured.err
 
 
 def test_cli_lon_negativa_es_valida():
@@ -679,3 +720,908 @@ def test_cli_peaks_csv(tmp_path):
     assert rows[0]["estado"] == "visible"
     assert rows[0]["fuente_altitud"] == "osm"
     assert float(rows[0]["dist_km"]) == pytest.approx(18.0, abs=0.5)
+
+
+# --- recorte de azimut en render/ ---------------------------------------
+
+
+def test_crop_span_desenrollado():
+    from src.render import _crop_span, _unwrap_deg
+
+    # sector normal: no se toca
+    assert _crop_span(0.0, 60.0) == (0.0, 60.0)
+    # sector que cruza el norte: el extremo superior se desenrolla
+    az_min, az_max_u = _crop_span(340.0, 40.0)
+    assert (az_min, az_max_u) == (340.0, 400.0)
+    assert az_max_u - az_min == 60.0
+    # az_min == az_max se lee como vuelta completa, no como sector vacío
+    assert _crop_span(90.0, 90.0) == (90.0, 450.0)
+    # normalización de entradas fuera de [0, 360)
+    assert _crop_span(700.0, 380.0) == (340.0, 380.0)
+
+    # los azimuts del sector 340->40 caen dentro; los de fuera, no
+    assert _unwrap_deg(350.0, 340.0) == 350.0
+    assert _unwrap_deg(10.0, 340.0) == 370.0
+    assert not az_min <= _unwrap_deg(100.0, 340.0) <= az_max_u
+    assert not az_min <= _unwrap_deg(339.9, 340.0) <= az_max_u
+
+
+def test_render_recorte_filtra_picos(tmp_path):
+    # Perfil sintético plano: aquí se comprueba el recorte, no la geometría.
+    az = np.arange(0.0, 360.0, 0.2)
+    profile = HorizonProfile(azimuths_deg=az,
+                             elevations_deg=np.full(az.shape, 2.0),
+                             truncated_at_m=np.full(az.shape, np.nan))
+    sightings = [_fake_sighting("dentro-350", 350.0),
+                 _fake_sighting("dentro-10", 10.0),
+                 _fake_sighting("fuera-100", 100.0),
+                 _fake_sighting("fuera-200", 200.0)]
+
+    out = tmp_path / "sector.png"
+    # sector que cruza el norte: el caso que rompería sin desenrollar
+    report = render_horizon_png(profile, str(out), peaks=sightings,
+                                az_min_deg=340.0, az_max_deg=40.0)
+    assert out.exists()
+    from PIL import Image
+    with Image.open(out) as img:
+        assert img.size == (1600, 520)
+
+    assert set(report.placed) == {"dentro-350", "dentro-10"}
+    assert set(report.out_of_range) == {"fuera-100", "fuera-200"}
+    assert report.discarded == []  # separados de los de fuera de encuadre
+
+
+def test_render_sin_recorte_no_cambia(tmp_path):
+    # El requisito explícito: sin recorte el PNG debe ser byte a byte el
+    # mismo que pasando el rango completo equivalente.
+    az = np.arange(0.0, 360.0, 0.2)
+    profile = HorizonProfile(azimuths_deg=az,
+                             elevations_deg=np.linspace(0.0, 5.0, az.size),
+                             truncated_at_m=np.full(az.shape, np.nan))
+    sin_recorte = tmp_path / "a.png"
+    render_horizon_png(profile, str(sin_recorte))
+    assert sin_recorte.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def _fake_sighting(name: str, azimuth_deg: float):
+    peak = Peak(osm_id=hash(name) % 1000, name=name, lat_deg=36.9,
+                lon_deg=-4.0, ele_m=1000.0, wikidata=None)
+    return PeakSighting(peak=peak, lat_deg=36.9, lon_deg=-4.0, h_m=1000.0,
+                        h_source="osm", azimuth_deg=azimuth_deg,
+                        distance_m=20_000.0, elevation_deg=1.5,
+                        visibility=Visibility.VISIBLE, truncated_at_m=None)
+
+
+def test_cli_recorte(tmp_path, capsys):
+    from peakid.__main__ import main
+    payload = {"elements": [
+        {"type": "node", "id": 1, "lat": MAROMA[0], "lon": MAROMA[1],
+         "tags": {"name": "Maroma", "ele": "2069"}},
+    ]}
+    cache_file = tmp_path / "overpass" / "peaks_36.7450_-4.0900_r100000.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+    out_png = tmp_path / "sector.png"
+
+    code = main(["panorama", "--lat", "36.745", "--lon", "-4.090",
+                 "--eye", "15.0", "--az-min", "0", "--az-max", "60",
+                 "--cache-dir", str(tmp_path), "-o", str(out_png)])
+    assert code == 0
+    assert out_png.exists()
+    out = capsys.readouterr().out
+    assert "sector 0°–60°" in out
+    # Maroma está a 13.2°, dentro del sector
+    assert "etiquetados 1" in out
+
+
+def test_cli_recorte_incompleto(capsys):
+    from peakid.__main__ import main
+    code = main(["panorama", "--lat", "36.745", "--lon", "-4.090",
+                 "--az-min", "0"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "--az-min y --az-max" in captured.err
+    assert "Traceback" not in captured.err
+
+
+# --- src/align/ (fase 2: proyección y alineamiento manual) --------------
+
+
+def test_project_profile_centro_y_bordes():
+    from src.align import AlignmentParams, project_profile
+
+    W, H = 4000, 3000
+    params = AlignmentParams(azimuth_deg=100.0, hfov_deg=65.0,
+                             pitch_deg=0.0, roll_deg=0.0)
+    # el centro exacto (azimut central, elevación = pitch) proyecta al
+    # centro de la imagen
+    x, y, ok = project_profile([100.0], [0.0], params, W, H)
+    assert ok[0]
+    assert x[0] == pytest.approx(W / 2)
+    assert y[0] == pytest.approx(H / 2)
+
+    # con pitch=0 y roll=0, azimut central + hfov/2 a elevación 0 cae
+    # exactamente en el borde derecho (x=W); el simétrico en x=0
+    x, y, ok = project_profile([100.0 + 32.5, 100.0 - 32.5], [0.0, 0.0],
+                               params, W, H)
+    assert x[0] == pytest.approx(W, abs=1e-6)
+    assert x[1] == pytest.approx(0.0, abs=1e-6)
+    assert y[0] == pytest.approx(H / 2)
+
+    # una muestra detrás de la cámara no es proyectable
+    _, _, ok = project_profile([280.0], [0.0], params, W, H)
+    assert not ok[0]
+
+    # elevación NaN (void del perfil) tampoco, sin reventar
+    _, _, ok = project_profile([100.0], [float("nan")], params, W, H)
+    assert not ok[0]
+
+
+def test_project_profile_pitch_y_roll():
+    from src.align import AlignmentParams, project_profile
+
+    W, H = 4000, 3000
+    # pitch: mirar hacia arriba exactamente a la elevación de la muestra la
+    # centra en la imagen
+    params = AlignmentParams(100.0, 65.0, pitch_deg=3.0, roll_deg=0.0)
+    x, y, ok = project_profile([100.0], [3.0], params, W, H)
+    assert ok[0] and y[0] == pytest.approx(H / 2)
+
+    # roll positivo = el lado derecho del horizonte dibujado BAJA (convenio
+    # documentado); con roll=90 el desplazamiento horizontal se vuelve
+    # vertical por completo
+    params = AlignmentParams(100.0, 65.0, pitch_deg=0.0, roll_deg=5.0)
+    _, y, _ = project_profile([110.0], [0.0], params, W, H)
+    assert y[0] > H / 2
+    params = AlignmentParams(100.0, 65.0, pitch_deg=0.0, roll_deg=90.0)
+    x, y, _ = project_profile([110.0], [0.0], params, W, H)
+    assert x[0] == pytest.approx(W / 2, abs=1e-6)
+    assert y[0] > H / 2
+
+
+def test_alignment_json_roundtrip(tmp_path):
+    from src.align import (AlignmentParams, alignment_json_path,
+                           load_alignment, save_alignment, seed_entry)
+
+    json_path = alignment_json_path(str(tmp_path / "IMG_1234.jpg"))
+    assert json_path.name == "IMG_1234.align.json"
+
+    params = AlignmentParams(347.2, 65.3, 2.1, -0.8)
+    seed = {"azimuth_deg": seed_entry(341.0, "exif"),
+            "hfov_deg": seed_entry(66.0, "exif"),
+            "pitch_deg": seed_entry(0.0, "default"),
+            "roll_deg": seed_entry(0.0, "default")}
+    save_alignment(str(json_path), "IMG_1234.jpg",
+                   {"lat_deg": 36.745, "lon_deg": -4.090, "eye_m": 4.7,
+                    "source": "cli"},
+                   seed, params, 4032, 3024, notes="bruma ligera, contraluz")
+
+    data = load_alignment(str(json_path))
+    assert data["version"] == 1
+    assert data["photo"] == "IMG_1234.jpg"
+    assert data["alignment"]["azimuth_deg"] == 347.2
+    # la resta que mide el error de brújula: ajustado - semilla EXIF
+    assert data["seed"]["azimuth_deg"]["source"] == "exif"
+    error_brujula = (data["alignment"]["azimuth_deg"]
+                     - data["seed"]["azimuth_deg"]["value"])
+    assert error_brujula == pytest.approx(6.2)
+    assert data["seed"]["pitch_deg"]["source"] == "default"
+    assert data["notes"] == "bruma ligera, contraluz"
+    assert data["created_utc"].endswith("Z")
+    assert data["image"] == {"width_px": 4032, "height_px": 3024,
+                             "exif_oriented": True}
+
+
+def test_pitch_positivo_baja_la_linea():
+    from src.align import AlignmentParams, project_profile
+
+    # Convenio de signo de la proyección: con pitch positivo la cámara mira
+    # hacia arriba y el horizonte se dibuja MÁS ABAJO. Invertido, el ajuste
+    # manual movería la línea al revés de lo que dice el slider — plausible
+    # pero incorrecto.
+    W, H = 4000, 3000
+    y_neutro = project_profile([100.0], [0.0],
+                               AlignmentParams(100.0, 65.0, 0.0, 0.0), W, H)[1]
+    y_arriba = project_profile([100.0], [0.0],
+                               AlignmentParams(100.0, 65.0, 2.0, 0.0), W, H)[1]
+    assert y_neutro[0] == pytest.approx(H / 2)
+    assert y_arriba[0] > y_neutro[0]
+
+
+def test_projected_y_per_column():
+    from src.align import projected_y_per_column
+
+    # polilínea proyectada de 3 puntos; se pide y en columnas intermedias
+    x_px = np.array([100.0, 200.0, 300.0])
+    y_px = np.array([50.0, 70.0, 60.0])
+    usable = np.array([True, True, True])
+    y = projected_y_per_column(x_px, y_px, usable,
+                               np.array([50.0, 150.0, 250.0, 400.0]))
+    assert np.isnan(y[0])            # antes del tramo cubierto
+    assert y[1] == pytest.approx(60.0)   # interpolado entre 50 y 70
+    assert y[2] == pytest.approx(65.0)
+    assert np.isnan(y[3])            # después
+
+    # con menos de dos puntos utilizables no hay nada que interpolar
+    y = projected_y_per_column(x_px, y_px, np.array([True, False, False]),
+                               np.array([150.0]))
+    assert np.isnan(y[0])
+
+
+# El detector automático de cresta se ELIMINÓ deliberadamente: detectaba
+# bordes de contraste arbitrarios (surcos, casas, cables) en vez de la
+# frontera cielo/terreno, y el residuo que producía no significaba nada.
+# Segmentar el skyline es el objetivo del modelo de la fase 2, no de
+# heurísticas. La tira muestra la banda ampliada y la línea proyectada;
+# el juicio del encaje lo hace el usuario mirando.
+
+
+def test_load_oriented_photo_orientacion_6(tmp_path):
+    from src.align import load_oriented_photo
+
+    # Foto "vertical de móvil": píxeles apaisados 400x300 + Orientation=6
+    # ("girar 90° CW al mostrar"), con marcador rojo en la esquina
+    # superior-izquierda de los píxeles CRUDOS. Se verifica contenido, no
+    # solo forma: con Orientation=6 ese marcador debe acabar arriba a la
+    # DERECHA de la imagen orientada.
+    raw = np.zeros((300, 400, 3), dtype=np.uint8)
+    raw[:] = (100, 150, 200)
+    raw[:30, :30] = (255, 0, 0)
+    photo = tmp_path / "vertical.jpg"
+    img = Image.fromarray(raw)
+    exif = img.getexif()
+    exif[0x0112] = 6
+    img.save(photo, exif=exif, quality=95)
+
+    oriented_img, oriented_np = load_oriented_photo(str(photo))
+    # tamaño intercambiado, e imagen y array del MISMO origen
+    assert oriented_img.size == (300, 400)
+    assert oriented_np.shape == (400, 300, 3)
+    # el marcador está arriba-derecha (media por la compresión JPEG)
+    corner = oriented_np[:30, -30:].reshape(-1, 3).mean(axis=0)
+    assert corner[0] > 200 and corner[1] < 60
+
+
+def test_build_strip_indexa_filas_correctas():
+    from src.align import build_strip
+
+    # foto sintética donde cada píxel codifica su FILA en el canal rojo:
+    # si la tira recortara en el eje equivocado (el bug transversal), los
+    # valores leídos no coincidirían con las filas esperadas
+    height, width = 512, 400
+    photo = np.zeros((height, width, 3), dtype=np.uint8)
+    photo[..., 0] = (np.arange(height)[:, None] // 2).astype(np.uint8)
+
+    # silueta proyectada: línea horizontal en la fila 300
+    x_px = np.array([0.0, width - 1.0])
+    y_px = np.array([300.0, 300.0])
+    usable = np.array([True, True])
+    columns_px = np.arange(0.0, width, 1.0)
+    strip_h, band_px = 21, 100.0
+    patch, columns_valid = build_strip(photo, x_px, y_px, usable,
+                                       columns_px, band_px, strip_h)
+
+    assert patch.shape == (strip_h, width, 3)
+    assert columns_valid.all()
+    # la fila central de la tira es la fila 300 de la foto; la primera, la
+    # 300-100=200; la última, la 300+100=400
+    assert patch[strip_h // 2, :, 0] == pytest.approx(np.full(width, 150), abs=1)
+    assert patch[0, :, 0] == pytest.approx(np.full(width, 100), abs=1)
+    assert patch[-1, :, 0] == pytest.approx(np.full(width, 200), abs=1)
+
+    # Columnas fuera del tramo proyectado: inválidas y rellenas con TRAMA
+    # diagonal (dos grises alternos), no con un color liso. Un relleno liso
+    # se lee como contenido de la foto: con la línea proyectada por encima
+    # del borde superior, la tira aparentaba estar del revés.
+    patch, columns_valid = build_strip(photo, np.array([100.0, 200.0]),
+                                       y_px, usable, columns_px, band_px,
+                                       strip_h)
+    assert not columns_valid[:100].any() and not columns_valid[201:].any()
+    fuera = patch[:, 0]
+    assert set(np.unique(fuera)) == {58, 96}   # las dos tintas de la trama
+    assert len(set(np.unique(fuera[:, 0]))) == 2  # alterna, no es liso
+
+
+def test_build_strip_sobre_foto_orientada(tmp_path):
+    from src.align import build_strip, load_oriented_photo
+
+    # el flujo completo carga orientada + tira: cresta conocida en el
+    # espacio ORIENTADO, la tira debe encontrarla donde toca
+    height_raw, width_raw = 300, 400  # crudo apaisado -> orientado 300x400
+    raw = np.zeros((height_raw, width_raw, 3), dtype=np.uint8)
+    raw[:] = (140, 170, 210)
+    # en el espacio orientado (400 filas x 300 cols), "terreno" desde la
+    # fila 250: con Orientation=6 la fila orientada r viene de la COLUMNA
+    # cruda r (crudo(fila, col) -> orientado(col, h_raw-1-fila)), así que
+    # son las columnas crudas 250 en adelante
+    raw[:, 250:] = (60, 55, 50)
+    photo = tmp_path / "o6.jpg"
+    img = Image.fromarray(raw)
+    exif = img.getexif()
+    exif[0x0112] = 6
+    img.save(photo, exif=exif, quality=95)
+
+    _, oriented = load_oriented_photo(str(photo))
+    # línea proyectada en la fila 250 del espacio orientado
+    patch, valid = build_strip(
+        oriented, np.array([0.0, 299.0]), np.array([250.0, 250.0]),
+        np.array([True, True]), np.arange(0.0, 300.0), 40.0, 21)
+    assert valid.all()
+    center_up = patch[9, :, 0].mean()    # justo encima del centro: cielo
+    center_down = patch[12, :, 0].mean()  # justo debajo: terreno
+    assert center_up > 120 and center_down < 80
+
+
+def test_load_session(tmp_path):
+    from src.align import (AlignmentParams, load_session, save_alignment,
+                           seed_entry)
+
+    photo = str(tmp_path / "IMG_1234.jpg")
+    # sin JSON: no hay sesión
+    assert load_session(photo) is None
+
+    seed = {"azimuth_deg": seed_entry(341.0, "exif"),
+            "hfov_deg": seed_entry(66.0, "exif"),
+            "pitch_deg": seed_entry(0.0, "default"),
+            "roll_deg": seed_entry(0.0, "default")}
+    save_alignment(str(tmp_path / "IMG_1234.align.json"), "IMG_1234.jpg",
+                   {"lat_deg": 36.745, "lon_deg": -4.090, "eye_m": 4.7,
+                    "source": "cli"},
+                   seed, AlignmentParams(26.2, 54.9, 6.4, 0.0),
+                   3060, 4080, notes="calima")
+
+    session = load_session(photo)
+    assert session is not None
+    assert session["alignment"]["azimuth_deg"] == 26.2
+    assert session["notes"] == "calima"
+    # el seed original viaja con la sesión: al reguardar se conserva TAL
+    # CUAL, porque la procedencia EXIF de la primera vez es la medida del
+    # error de brújula y una recarga no debe sobrescribirla
+    assert session["seed"]["azimuth_deg"] == {"value": 341.0, "source": "exif"}
+
+    # JSON corrupto o de versión desconocida: sesión inutilizable, None
+    (tmp_path / "IMG_1234.align.json").write_text("{basura", encoding="utf-8")
+    assert load_session(photo) is None
+    (tmp_path / "IMG_1234.align.json").write_text('{"version": 99}',
+                                                  encoding="utf-8")
+    assert load_session(photo) is None
+
+
+# --- búsqueda automática de alineamiento (asistente, NO la fase 2) ------
+
+
+def _foto_desde_perfil(profile, params, width_px, height_px):
+    """Foto sintética cuyo horizonte ES el perfil proyectado con params:
+    cielo con degradado arriba, terreno oscuro debajo de la línea."""
+    from src.align import project_profile, projected_y_per_column
+
+    x_px, y_px, usable = project_profile(
+        profile.azimuths_deg, profile.elevations_deg, params,
+        width_px, height_px)
+    y_line = projected_y_per_column(x_px, y_px, usable,
+                                    np.arange(float(width_px)))
+    photo = np.zeros((height_px, width_px, 3), dtype=np.uint8)
+    rows_idx = np.arange(height_px)[:, None]
+    photo[..., 0] = 150
+    photo[..., 1] = np.clip(185 - rows_idx * 0.03, 0, 255)
+    photo[..., 2] = np.clip(225 - rows_idx * 0.05, 0, 255)
+    terrain = rows_idx >= np.nan_to_num(y_line, nan=height_px)[None, :]
+    for channel, value in enumerate((70, 62, 52)):
+        photo[..., channel] = np.where(terrain, value, photo[..., channel])
+    return photo
+
+
+def _perfil_sintetico():
+    az = np.arange(0.0, 360.0, 0.2)
+    elev = (1.0 + 2.5 * np.exp(-((az - 20.0) / 5.0) ** 2)
+            + 1.6 * np.exp(-((az - 38.0) / 3.0) ** 2)
+            + 0.8 * np.sin(np.radians(az * 3.0)))
+    return HorizonProfile(az, elev, np.full(az.shape, np.nan))
+
+
+def test_detect_photo_skyline_sintetica():
+    from src.align import AlignmentParams
+    from src.align.search import detect_photo_skyline
+
+    profile = _perfil_sintetico()
+    true_params = AlignmentParams(23.7, 55.0, 2.0, 1.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, true_params, W, H)
+    # obstáculos que el detector debe ignorar: un cable cruzando el cielo y
+    # bandas de contraste alto muy por debajo de la cresta
+    photo[80:82, :] = (60, 60, 60)
+    photo[700:720, :] = 250
+    photo[750:770, :] = 10
+
+    from src.align import project_profile, projected_y_per_column
+    x_px, y_px, usable = project_profile(
+        profile.azimuths_deg, profile.elevations_deg, true_params, W, H)
+    cols, rows, valid = detect_photo_skyline(photo)
+    y_true = projected_y_per_column(x_px, y_px, usable, cols)
+    ok = valid & ~np.isnan(y_true)
+    assert ok.mean() > 0.8
+    # la cresta detectada sigue a la real (tolerancia: el paso de submuestreo)
+    assert np.median(np.abs(rows[ok] - y_true[ok])) < 4.0
+
+
+def test_busqueda_recupera_desplazamiento_sintetico():
+    """CASO 7 DEL CONTRATO (versión sintética): renderizar el horizonte,
+    desplazarlo artificialmente +13.7° y comprobar que el alineamiento
+    recupera 13.7° ±0.1°.
+
+    La foto se genera proyectando el perfil con az = semilla + 13.7 (más
+    FOV/pitch/roll conocidos); la búsqueda parte de la semilla y debe volver
+    a los parámetros verdaderos. Esto valida el buscador como asistente: el
+    uso real sigue pasando por el juicio del usuario en la GUI.
+    """
+    from src.align import AlignmentParams
+    from src.align.search import detect_photo_skyline, search_alignment
+
+    profile = _perfil_sintetico()
+    seed_az = 10.0
+    true_params = AlignmentParams(seed_az + 13.7, 55.0, 2.0, 1.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, true_params, W, H)
+
+    cols, rows, valid = detect_photo_skyline(photo)
+    result = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                              cols[valid], rows[valid], W, H,
+                              center_az_deg=seed_az)
+    assert result.candidates, "la búsqueda no devolvió ningún candidato"
+    best = result.candidates[0].params
+
+    recovered_shift = (best.azimuth_deg - seed_az + 180.0) % 360.0 - 180.0
+    assert recovered_shift == pytest.approx(13.7, abs=0.1)
+    assert best.hfov_deg == pytest.approx(55.0, abs=1.0)
+    assert best.pitch_deg == pytest.approx(2.0, abs=0.2)
+    assert best.roll_deg == pytest.approx(1.0, abs=0.2)
+    assert result.candidates[0].error_deg < 0.05
+    # los tres se puntúan con la misma métrica exacta, así que la lista está
+    # ordenada de verdad por el error mostrado (en píxeles, que es el
+    # espacio de comparación)
+    errors_px = [c.error_px for c in result.candidates]
+    assert errors_px == sorted(errors_px)
+    # perfil rico + FOV ancho: el óptimo es claro y no toca ningún borde
+    assert result.reliable
+    assert not result.ambiguous
+
+
+def _cresta_proyectada(profile, params, width_px, height_px, step=5.0):
+    """Cresta 'detectada' perfecta: la propia línea proyectada con params."""
+    from src.align import project_profile, projected_y_per_column
+
+    x_px, y_px, usable = project_profile(
+        profile.azimuths_deg, profile.elevations_deg, params,
+        width_px, height_px)
+    cols = np.arange(60.0, width_px - 60.0, step)
+    rows = projected_y_per_column(x_px, y_px, usable, cols)
+    keep = ~np.isnan(rows)
+    return cols[keep], rows[keep]
+
+
+def test_solve_pitch_roll_recupera_los_dos():
+    """Ata los SIGNOS del ajuste automático.
+
+    El modelo es y(pitch, roll) − y(0,0) ≈ f·tan(pitch) + (x − W/2)·roll_rad:
+    el residuo es una recta en x, su ordenada da la inclinación y su
+    pendiente el giro. Si el signo del giro se invirtiera, el modo automático
+    torcería la línea al revés sin que nada fallara de forma visible.
+    """
+    from src.align import AlignmentParams
+    from src.align.search import solve_pitch_roll
+
+    profile = _perfil_sintetico()
+    W, H = 1200, 900
+    for pitch, roll in ((2.0, 0.0), (0.0, 1.5), (3.0, -2.0), (-4.0, 3.0),
+                        (8.0, 5.0)):
+        verdad = AlignmentParams(23.7, 55.0, pitch, roll)
+        cols, rows = _cresta_proyectada(profile, verdad, W, H)
+        # se parte de pitch/roll a cero: el solver debe llegar solo
+        partida = AlignmentParams(23.7, 55.0, 0.0, 0.0)
+        solved = solve_pitch_roll(profile.azimuths_deg, profile.elevations_deg,
+                                  partida, cols, rows, W, H)
+        assert solved is not None
+        assert solved[0] == pytest.approx(pitch, abs=0.05)
+        assert solved[1] == pytest.approx(roll, abs=0.05)
+
+
+def test_solve_pitch_roll_es_robusto_y_se_planta():
+    from src.align import AlignmentParams
+    from src.align.search import solve_pitch_roll
+
+    profile = _perfil_sintetico()
+    W, H = 1200, 900
+    verdad = AlignmentParams(23.7, 55.0, 3.0, -1.5)
+    cols, rows = _cresta_proyectada(profile, verdad, W, H)
+
+    # 10% de columnas disparatadas (tejados, arbustos): el rechazo por MAD
+    # debe impedir que tuerzan la recta
+    sucias = rows.copy()
+    sucias[::10] += 180.0
+    partida = AlignmentParams(23.7, 55.0, 0.0, 0.0)
+    solved = solve_pitch_roll(profile.azimuths_deg, profile.elevations_deg,
+                              partida, cols, sucias, W, H)
+    assert solved[0] == pytest.approx(3.0, abs=0.15)
+    assert solved[1] == pytest.approx(-1.5, abs=0.15)
+
+    # con cuatro columnas no se resuelve: mejor None que un ajuste inventado
+    assert solve_pitch_roll(profile.azimuths_deg, profile.elevations_deg,
+                            partida, cols[:4], rows[:4], W, H) is None
+
+
+def test_sector_to_ranges():
+    from src.align.search import FOV_RANGE_DEG, sector_to_ranges
+
+    # sector normal de 30°
+    center, width, lo, hi, fov_lo, fov_hi = sector_to_ranges(20.0, 50.0)
+    assert (center, width, lo, hi) == pytest.approx((35.0, 30.0, 20.0, 50.0))
+    assert fov_lo == pytest.approx(15.0) and fov_hi == pytest.approx(60.0)
+
+    # arco > 180° -> el COMPLEMENTARIO, que cruza el norte. Inequívoco solo
+    # porque el FOV máximo son 80°: ninguna foto abarca 340°.
+    center, width, lo, hi, _fl, _fh = sector_to_ranges(10.0, 350.0)
+    assert width == pytest.approx(20.0)
+    assert lo == pytest.approx(350.0) and hi == pytest.approx(370.0)
+    assert center == pytest.approx(0.0, abs=1e-9)
+
+    # el FOV se acota al rango soportado por el buscador
+    _c, _w, _lo, _hi, fov_lo, fov_hi = sector_to_ranges(0.0, 120.0)
+    assert fov_lo >= FOV_RANGE_DEG[0] and fov_hi <= FOV_RANGE_DEG[1]
+
+
+def test_exif_gps_vacio_no_produce_nan():
+    """Hay cámaras que escriben el bloque GPS con racionales 0/0 y el
+    hemisferio a '\\x00' cuando no llegaron a fijar posición (medido en
+    141720.jpg). Eso daba lat/lon = NaN, que entraban en el pipeline sin que
+    nada fallara: el fallo callado que CLAUDE.md prohíbe.
+    """
+    from src.align import _dms_to_deg, _seed_from_exif
+
+    class FakeExif(dict):
+        def __init__(self, ifds):
+            super().__init__()
+            self._ifds = ifds
+
+        def get_ifd(self, tag):
+            return self._ifds.get(tag, {})
+
+    nan = float("nan")
+    vacio = FakeExif({0x8825: {1: "\x00", 2: (nan, nan, nan),
+                               3: "\x00", 4: (nan, nan, nan), 6: nan}})
+    seed = _seed_from_exif(vacio)
+    assert "lat_deg" not in seed and "lon_deg" not in seed
+    assert seed.get("gps_invalid") is True   # se dice, no se calla
+
+    # el hemisferio tiene que ser explícito: '\x00' no es "norte"
+    assert _dms_to_deg((36.0, 45.0, 24.0), "\x00") is None
+    assert _dms_to_deg((36.0, 45.0, 24.0), "N") == pytest.approx(36.756667)
+    assert _dms_to_deg((4.0, 6.0, 12.0), "W") == pytest.approx(-4.103333)
+    assert _dms_to_deg((nan, 45.0, 24.0), "N") is None
+    assert _dms_to_deg(None, "N") is None
+
+    # un GPS bueno sigue funcionando y no se marca inválido
+    bueno = FakeExif({0x8825: {1: "N", 2: (36.0, 45.0, 24.674),
+                               3: "W", 4: (4.0, 6.0, 12.406), 17: 341.0}})
+    seed = _seed_from_exif(bueno)
+    assert seed["lat_deg"] == pytest.approx(36.7568, abs=1e-3)
+    assert seed["lon_deg"] == pytest.approx(-4.1034, abs=1e-3)
+    assert "gps_invalid" not in seed
+
+
+def test_cli_rechaza_coordenadas_invalidas():
+    from peakid.__main__ import _CliError, _require_valid_coords
+
+    _require_valid_coords(36.745, -4.090, "cli")        # válidas: no protesta
+    for lat, lon in ((float("nan"), -4.0), (36.7, float("inf")),
+                     (95.0, -4.0), (36.7, 200.0), (None, -4.0)):
+        with pytest.raises(_CliError):
+            _require_valid_coords(lat, lon, "exif-gps")
+
+
+def test_error_saturado_no_parece_casi_bueno():
+    """El recorte de residuo a 40 px satura: un desajuste de 350 px daba el
+    mismo número que uno de 45 y se informó como '38 px, casi bueno' cuando
+    la línea iba a 350 px de la cresta. `saturated` lo distingue."""
+    from src.align.search import SearchCandidate, _clipped_mean_abs, _saturated_fraction
+
+    catastrofico = np.full(200, 350.0)
+    mediocre = np.concatenate([np.full(180, 12.0), np.full(20, 300.0)])
+    assert _clipped_mean_abs(catastrofico) == pytest.approx(40.0)
+    assert _saturated_fraction(catastrofico) == pytest.approx(1.0)
+    assert _saturated_fraction(mediocre) == pytest.approx(0.1)
+
+    from src.align import AlignmentParams
+    p = AlignmentParams(0.0, 50.0, 0.0, 0.0)
+    assert SearchCandidate(p, 40.0, 0.5, 1.0, 1.0).saturated
+    assert not SearchCandidate(p, 12.5, 0.2, 1.0, 0.1).saturated
+
+
+def test_peak_label_con_nombre_alternativo():
+    """El caso del Naranjo de Bulnes.
+
+    En OSM `name` lleva el topónimo LOCAL: el Naranjo está como
+    `name=Picu Urriellu` con `alt_name=Naranjo de Bulnes`, así que aparecía
+    rotulado con un nombre que el usuario no reconocía y parecía faltar de
+    la lista. En Asturias, Galicia, Euskadi y Catalunya ese va a ser el caso
+    habitual, no la excepción.
+    """
+    from src.peaks import Peak, _parse_node
+
+    urriellu = _parse_node({
+        "type": "node", "id": 129959999, "lat": 43.20083, "lon": -4.81770,
+        "tags": {"name": "Picu Urriellu", "alt_name": "Naranjo de Bulnes",
+                 "name:es": "Pico Urriellu", "name:ast": "Picu Urriellu",
+                 "ele": "2518", "natural": "peak", "wikidata": "Q2636482"}})
+    assert urriellu.name == "Picu Urriellu"
+    assert urriellu.alt_name == "Naranjo de Bulnes"   # alt_name gana a name:es
+    assert urriellu.label == "Picu Urriellu (Naranjo de Bulnes)"
+    assert urriellu.ele_m == 2518.0
+
+    # sin alternativo, la etiqueta no se ensucia con paréntesis vacíos
+    diente = _parse_node({
+        "type": "node", "id": 5495616040, "lat": 43.20712, "lon": -4.83212,
+        "tags": {"name": "Diente de Urriellu", "ele": "2322"}})
+    assert diente.alt_name is None
+    assert diente.label == "Diente de Urriellu"
+
+    # name:es sirve cuando no hay alt_name, pero no si repite el nombre
+    con_es = _parse_node({"type": "node", "id": 1, "lat": 0.0, "lon": 0.0,
+                          "tags": {"name": "Aizkorri", "name:es": "Aizcorri"}})
+    assert con_es.label == "Aizkorri (Aizcorri)"
+    igual = _parse_node({"type": "node", "id": 2, "lat": 0.0, "lon": 0.0,
+                         "tags": {"name": "Mulhacén", "name:es": "Mulhacén"}})
+    assert igual.label == "Mulhacén"
+
+    # sin nombre, identificable por su id de OSM en vez de en blanco
+    assert Peak(42, None, 0.0, 0.0, None, None).label == "osm:42"
+
+
+def test_detector_descarta_obstaculos_estrechos():
+    """Postes, farolas y ramas en primer plano rompen la cresta con un
+    escalón de cientos de píxeles y envenenan el ajuste de pitch/roll: unas
+    pocas columnas que no son horizonte tuercen la recta.
+
+    El detector parte la cresta por esos escalones y tira los tramos
+    demasiado cortos para ser relieve.
+    """
+    from src.align import AlignmentParams
+    from src.align.search import detect_photo_skyline
+
+    profile = _perfil_sintetico()
+    verdad = AlignmentParams(23.7, 55.0, 2.0, 0.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, verdad, W, H)
+    # tres postes estrechos que suben muy por encima de la cresta
+    for x0 in (250, 600, 940):
+        photo[:, x0:x0 + 7] = (60, 55, 50)
+
+    cols, rows, valid = detect_photo_skyline(photo)
+    for x0 in (250, 600, 940):
+        # exactamente las columnas del poste (250..256), no sus vecinas, que
+        # son cresta legítima y deben conservarse
+        sobre_poste = (cols >= x0) & (cols <= x0 + 6)
+        assert not valid[sobre_poste].any(), (
+            f"el poste en x={x0} sigue alimentando el ajuste")
+    assert valid.mean() > 0.7   # el resto de la cresta se conserva
+
+
+def test_detector_conserva_la_cresta_si_todo_es_fragmentado():
+    # Salvaguarda: si el criterio se llevara casi todo, es que la foto es así
+    # de accidentada, y quedarse sin columnas es peor que conservarlas.
+    from src.align.search import _drop_short_segments
+
+    rows = np.arange(60, dtype=float) * 37 % 400   # dientes de sierra puros
+    valid = np.ones(60, dtype=bool)
+    conservado = _drop_short_segments(rows, valid, height=400, width=60)
+    assert conservado.sum() >= 0.2 * valid.sum()
+
+
+def test_bindings_numericos_son_teclas_no_botones(tmp_path):
+    """En Tk un detalle NUMÉRICO en un binding es el número de BOTÓN del
+    ratón, no una tecla: bind("<1>") registra <Button-1>.
+
+    Ese despiste hacía dos cosas a la vez: las teclas 1..5 no seleccionaban
+    candidato, y cada clic izquierdo en la foto aplicaba el candidato 1,
+    llevándose por delante el ajuste manual en curso. El test mira los
+    bindings registrados de verdad, que es donde el error es visible.
+    """
+    import tkinter as tk
+
+    from src.align import AlignmentParams
+    from src.align.gui import _AlignApp
+
+    try:
+        tk.Tk().destroy()
+    except tk.TclError:                      # sin display: nada que comprobar
+        pytest.skip("sin entorno gráfico")
+
+    # la regla de Tk que provoca el fallo, comprobada aquí para que el test
+    # siga significando algo si algún día cambia
+    root = tk.Tk()
+    root.bind("<1>", lambda _e: None)
+    root.bind("<Key-1>", lambda _e: None)
+    regla = set(root.bind())
+    root.destroy()
+    assert "<Button-1>" in regla   # <1> ES un botón del ratón
+    assert "1" in regla            # <Key-1> ES la tecla
+
+    # y ahora los bindings REALES de la ventana, que es donde estaba el fallo
+    profile = _perfil_sintetico()
+    params = AlignmentParams(23.7, 55.0, 2.0, 1.0)
+    photo = tmp_path / "sintetica.jpg"
+    Image.fromarray(_foto_desde_perfil(profile, params, 600, 450)).save(
+        photo, quality=90)
+
+    app = _AlignApp(str(photo), profile, 36.7, -4.0, 10.0, params, {}, "cli")
+    registrados = set(app.root.bind())
+    app.root.destroy()
+
+    assert {"0", "1", "2", "3", "4", "5"} <= registrados, (
+        f"los dígitos deben estar como TECLAS; registrado: {registrados}")
+    # ningún binding de botón en el toplevel: <1>..<5> habrían registrado
+    # <Button-N> y cada clic en la foto aplicaría el candidato 1
+    assert not [b for b in registrados if b.startswith("<Button-")], registrados
+
+
+def test_busqueda_detecta_ambiguedad_con_campo_estrecho():
+    """EL FALLO REAL DEL USUARIO (teleobjetivo de Sierra Nevada).
+
+    Con campo de visión estrecho la firma del horizonte es pobre y la
+    correlación tiene muchos máximos casi equivalentes. Aquí se fuerza el
+    caso extremo: un perfil PERIÓDICO (la misma cresta repetida cada 30° de
+    azimut) fotografiado con 15° de campo. La búsqueda no puede distinguir
+    una repetición de otra, y eso debe DECIRSE, no presentarse como solución.
+    """
+    from src.align import AlignmentParams
+    from src.align.search import detect_photo_skyline, search_alignment
+
+    az = np.arange(0.0, 360.0, 0.2)
+    # Periodo de 15°, MENOR que el semirrango explorado (±20°): así la
+    # repetición equivalente cae DENTRO del espacio de búsqueda y la
+    # ambigüedad es real. Con periodo mayor que el rango no habría nada que
+    # detectar, solo un espacio demasiado estrecho.
+    elev = 2.0 + 1.5 * np.sin(np.radians(az * 24.0))
+    profile = HorizonProfile(az, elev, np.full(az.shape, np.nan))
+    true_params = AlignmentParams(40.0, 15.0, 1.0, 0.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, true_params, W, H)
+
+    cols, rows, valid = detect_photo_skyline(photo)
+    result = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                              cols[valid], rows[valid], W, H,
+                              center_az_deg=40.0, az_margin_deg=20.0,
+                              fov_hint_deg=15.0, fov_margin_deg=5.0)
+    assert result.candidates
+    assert result.ambiguous, (
+        f"margen {result.ambiguity_margin:.2f}: la búsqueda debería admitir "
+        "que no distingue entre repeticiones del mismo perfil")
+    assert result.alternative is not None
+    separation = abs((result.alternative.params.azimuth_deg
+                      - result.candidates[0].params.azimuth_deg + 180.0)
+                     % 360.0 - 180.0)
+    assert separation > 10.0
+    assert not result.reliable
+
+
+def test_busqueda_detecta_saturacion_de_fov():
+    # Rango de FOV que NO contiene el verdadero: el óptimo se apoya en el
+    # borde y hay que avisar de que el bueno puede estar fuera. Es lo que
+    # pasó con el teleobjetivo real contra el rango antiguo de 40-75°.
+    from src.align import AlignmentParams
+    from src.align.search import build_fov_grid, detect_photo_skyline, search_alignment
+
+    profile = _perfil_sintetico()
+    true_params = AlignmentParams(23.7, 20.0, 1.0, 0.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, true_params, W, H)
+    cols, rows, valid = detect_photo_skyline(photo)
+
+    # rango 25-45: el verdadero (20) queda justo fuera -> el óptimo se apoya
+    # en el extremo inferior y hay que avisar
+    fuera = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                             cols[valid], rows[valid], W, H,
+                             center_az_deg=23.7, fov_hint_deg=35.0,
+                             fov_margin_deg=10.0)
+    assert fuera.fov_at_edge
+    assert not fuera.reliable
+    # LÍMITE MEDIDO de la detección de saturación: solo muerde cuando el
+    # verdadero está CERCA del borde. Con el rango 45-65 (verdad 20, muy
+    # lejos) la búsqueda encuentra un óptimo interior espurio en ~48° y
+    # fov_at_edge NO se dispara. Contra ese caso protege la ambigüedad, no
+    # la saturación; documentado aquí para que nadie confíe de más en ella.
+    lejos = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                             cols[valid], rows[valid], W, H,
+                             center_az_deg=23.7, fov_hint_deg=55.0,
+                             fov_margin_deg=10.0)
+    assert not lejos.fov_at_edge
+    assert lejos.candidates[0].params.hfov_deg > 40.0  # espurio, lejos de 20
+
+    # el rango completo por defecto sí lo contiene
+    dentro = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                              cols[valid], rows[valid], W, H,
+                              center_az_deg=23.7)
+    assert not dentro.fov_at_edge
+    assert dentro.candidates[0].params.hfov_deg == pytest.approx(20.0, abs=1.5)
+
+    # la rejilla geométrica cubre de 10 a 80 con resolución relativa
+    # constante: densa donde el teleobjetivo la necesita
+    grid = build_fov_grid()
+    assert grid[0] == pytest.approx(10.0) and grid[-1] == pytest.approx(80.0)
+    assert np.all(np.diff(grid) > 0)
+    assert (grid[1] - grid[0]) < (grid[-1] - grid[-2])  # paso creciente
+
+
+def test_busqueda_hints_acotan_el_espacio():
+    # Sin pista, un desplazamiento de 35° cae fuera de los ±20° explorados y
+    # la búsqueda ni siquiera mira ahí (el fallo del caso de Granada);
+    # con --az-hint el rango se centra donde toca y lo encuentra.
+    from src.align import AlignmentParams
+    from src.align.search import detect_photo_skyline, search_alignment
+
+    profile = _perfil_sintetico()
+    true_az = 45.0
+    true_params = AlignmentParams(true_az, 55.0, 2.0, 1.0)
+    W, H = 1200, 900
+    photo = _foto_desde_perfil(profile, true_params, W, H)
+    cols, rows, valid = detect_photo_skyline(photo)
+
+    sin_pista = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                                 cols[valid], rows[valid], W, H,
+                                 center_az_deg=10.0)
+    assert sin_pista.az_range_deg == pytest.approx((-10.0, 30.0))
+    assert not sin_pista.reliable  # el verdadero ni se exploró
+
+    con_pista = search_alignment(profile.azimuths_deg, profile.elevations_deg,
+                                 cols[valid], rows[valid], W, H,
+                                 center_az_deg=true_az, az_margin_deg=10.0)
+    assert con_pista.az_range_deg == pytest.approx((35.0, 55.0))
+    assert con_pista.candidates[0].params.azimuth_deg == pytest.approx(
+        true_az, abs=0.3)
+
+
+def test_exif_transpose_orienta_la_foto(tmp_path):
+    from PIL import Image, ImageOps
+
+    # Una foto vertical de móvil se guarda con los píxeles apaisados más el
+    # tag Orientation=6 ("girar 90° CW al mostrar"). Sin aplicarlo, la GUI
+    # dibujaba el buffer crudo bajo una silueta en orientación normal: la
+    # foto salía del revés.
+    photo = tmp_path / "vertical.jpg"
+    raw = Image.new("RGB", (4000, 3000))
+    exif = raw.getexif()
+    exif[0x0112] = 6  # Orientation
+    raw.save(photo, exif=exif)
+
+    with Image.open(photo) as opened:
+        assert opened.size == (4000, 3000)  # pillow NO orienta al abrir
+        oriented = ImageOps.exif_transpose(opened)
+    # tras orientar, ancho y alto se intercambian: de ahí depende toda la
+    # proyección, así que el tamaño hay que leerlo DESPUÉS
+    assert oriented.size == (3000, 4000)
+
+
+def test_seed_from_exif_objeto_falso():
+    from src.align import _seed_from_exif
+
+    class FakeExif(dict):
+        def __init__(self, base, ifds):
+            super().__init__(base)
+            self._ifds = ifds
+
+        def get_ifd(self, tag):
+            return self._ifds.get(tag, {})
+
+    # focal 35mm de 28 -> hfov = 2*atan(18/28) = 65.47°; GPS de Torre del
+    # Mar con dirección 341° y hemisferio W (longitud negativa)
+    exif = FakeExif(
+        {41989: 28},
+        {0x8825: {1: "N", 2: (36, 44, 42.0), 3: "W", 4: (4, 5, 24.0),
+                  17: 341.0}})
+    seed = _seed_from_exif(exif)
+    assert seed["hfov_deg"] == pytest.approx(65.47, abs=0.01)
+    assert seed["azimuth_deg"] == 341.0
+    assert seed["lat_deg"] == pytest.approx(36.745, abs=1e-4)
+    assert seed["lon_deg"] == pytest.approx(-4.090, abs=1e-4)
+
+    # sin EXIF: dict vacío, sin reventar
+    assert _seed_from_exif(FakeExif({}, {})) == {}

@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "photo": "20260812_104438.jpg",
+  "created_utc": "2026-08-15T09:06:09Z",
+  "notes": "",
+  "observer": {
+    "lat_deg": 36.434,
+    "lon_deg": -5.178389,
+    "eye_m": 69.01943999996492,
+    "source": "cli"
+  },
+  "seed": {
+    "azimuth_deg": {
+      "value": 329.25,
+      "source": "default"
+    },
+    "hfov_deg": {
+      "value": 63.91,
+      "source": "exif"
+    },
+    "pitch_deg": {
+      "value": 13.35,
+      "source": "default"
+    },
+    "roll_deg": {
+      "value": -0.81,
+      "source": "default"
+    }
+  },
+  "alignment": {
+    "azimuth_deg": 329.2,
+    "hfov_deg": 63.9,
+    "pitch_deg": 13.35,
+    "roll_deg": -0.8
+  },
+  "image": {
+    "width_px": 4080,
+    "height_px": 3060,
+    "exif_oriented": true
+  }
+}

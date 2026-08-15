@@ -41,16 +41,22 @@ _LABEL_BAND_1X = 150  # alto (a 1x) de la banda de etiquetas cuando hay picos
 
 @dataclass
 class LabelReport:
-    """Qué picos consiguieron etiqueta y cuáles se descartaron por colisión,
-    ambos en orden de prioridad. Para verificar el criterio de descarte."""
+    """Qué picos consiguieron etiqueta y cuáles no, en orden de prioridad.
+
+    `discarded` y `out_of_range` se mantienen separados a propósito: perder la
+    competencia por una ranura y quedar fuera del encuadre son cosas
+    distintas. Ninguna desaparece en silencio."""
     placed: list[str]
     discarded: list[str]
+    out_of_range: list[str]
 
 
 def render_horizon_png(profile: HorizonProfile, path: str,
                        peaks: list[PeakSighting] | None = None,
                        width_px: int = 1600,
-                       height_px: int = 520) -> LabelReport | None:
+                       height_px: int = 520,
+                       az_min_deg: float | None = None,
+                       az_max_deg: float | None = None) -> LabelReport | None:
     """Dibuja el perfil de horizonte como silueta rellena y lo guarda en path.
 
     Tres clases de sector: terreno fiable (silueta oscura), rayo truncado por
@@ -63,7 +69,19 @@ def render_horizon_png(profile: HorizonProfile, path: str,
     nombre+altitud rotado 90° en la banda superior. Los que colisionan con
     etiquetas de mayor prioridad se descartan; devuelve el informe de qué
     quedó y qué se tiró (None si no se pasaron picos).
+
+    az_min_deg/az_max_deg recortan el dibujo a un sector, reescalando el eje X
+    al rango y filtrando las etiquetas. Se dan ambos o ninguno. El sector
+    puede cruzar el norte (340→40); sin recorte el resultado es idéntico al
+    de antes de existir esta opción.
     """
+    if (az_min_deg is None) != (az_max_deg is None):
+        raise ValueError("az_min_deg y az_max_deg se pasan juntos o ninguno")
+    cropped = az_min_deg is not None
+    az_min, az_max_u = _crop_span(az_min_deg or 0.0,
+                                  az_max_deg if cropped else 360.0)
+    span_deg = az_max_u - az_min
+
     s = 2  # supersampling: se dibuja a 2x y se reduce con LANCZOS
     width, height = width_px * s, height_px * s
     margin_l, margin_r = 64 * s, 20 * s
@@ -73,10 +91,14 @@ def render_horizon_png(profile: HorizonProfile, path: str,
     y0, y1 = margin_t, height - margin_b
     plot_w, plot_h = x1 - x0, y1 - y0
 
-    az = np.asarray(profile.azimuths_deg, dtype=float)
-    elev = np.asarray(profile.elevations_deg, dtype=float)
-    trunc = np.asarray(profile.truncated_at_m, dtype=float)
-    az_step_deg = az[1] - az[0] if az.size > 1 else 0.2
+    az_full = np.asarray(profile.azimuths_deg, dtype=float)
+    # el paso sale del array ORIGINAL: un sector estrecho puede dejar una sola
+    # muestra, y ahí az[1]-az[0] reventaría
+    az_step_deg = az_full[1] - az_full[0] if az_full.size > 1 else 0.2
+    az, elev, trunc = _crop_profile(
+        az_full, np.asarray(profile.elevations_deg, dtype=float),
+        np.asarray(profile.truncated_at_m, dtype=float),
+        az_min, az_max_u, az_step_deg)
 
     classes = np.where(np.isnan(elev), _NODATA,
                        np.where(~np.isnan(trunc), _TRUNC, _OK))
@@ -92,7 +114,11 @@ def render_horizon_png(profile: HorizonProfile, path: str,
     lo, hi = lo - pad, hi + pad
 
     def x_at(az_deg: float) -> float:
-        return x0 + az_deg / 360.0 * plot_w
+        """az_deg en espacio DESENROLLADO (ver _unwrap_deg). Clampado al
+        marco porque pillow no recorta: sin esto la silueta del borde se
+        saldría del área de dibujo."""
+        x = x0 + (az_deg - az_min) / span_deg * plot_w
+        return min(max(x, x0), x1)
 
     def y_at(elev_deg: float) -> float:
         return y0 + (hi - elev_deg) / (hi - lo) * plot_h
@@ -116,8 +142,9 @@ def render_horizon_png(profile: HorizonProfile, path: str,
         if tick != 0.0:
             ty = y_at(tick)
             draw.line([x0, ty, x1, ty], fill=_GRID, width=s)
-    for az_deg in range(0, 361, 45):
-        gx = x_at(az_deg)
+    az_ticks = _azimuth_ticks(az_min, az_max_u, cropped)
+    for tick_az, _ in az_ticks:
+        gx = x_at(tick_az)
         draw.line([gx, y0, gx, y1], fill=_GRID, width=s)
 
     # silueta: un polígono por tramo contiguo de la misma clase
@@ -139,11 +166,13 @@ def render_horizon_png(profile: HorizonProfile, path: str,
     # marco y ejes
     draw.rectangle([x0, y0, x1, y1], outline=_GRID, width=s)
 
-    for az_deg, label in _CARDINALS:
-        tx = x_at(az_deg)
+    for tick_az, label in az_ticks:
+        if label is None:
+            continue
+        tx = x_at(tick_az)
         draw.line([tx, y1, tx, y1 + 5 * s], fill=_INK_MUTED, width=s)
-        draw.text((tx, y1 + 8 * s), f"{label} ({az_deg:.0f}°)",
-                  font=font_cardinal, fill=_INK, anchor="ma")
+        draw.text((tx, y1 + 8 * s), label, font=font_cardinal,
+                  fill=_INK, anchor="ma")
 
     for tick in ticks:
         ty = y_at(tick)
@@ -159,18 +188,99 @@ def render_horizon_png(profile: HorizonProfile, path: str,
     if peaks:
         report = _place_labels(img, draw, peaks, x_at, y_at,
                                band_top=56 * s, band_bottom=y0 - 2 * s,
-                               y_plot=(y0, y1), font=font, s=s)
+                               y_plot=(y0, y1), font=font, s=s,
+                               az_min=az_min, az_max_u=az_max_u)
 
     img = img.resize((width_px, height_px), Image.LANCZOS)
     img.save(path, "PNG")
     return report
 
 
+def _crop_span(az_min_deg: float, az_max_deg: float) -> tuple[float, float]:
+    """Normaliza a [0,360) y DESENROLLA el extremo superior.
+
+    Si az_max <= az_min el sector cruza el norte y se le suman 360: 340→40
+    devuelve (340, 400), un intervalo de 60° ya monótono. az_min == az_max se
+    interpreta como vuelta completa desde az_min (span 360), no como sector
+    vacío, que sería inútil.
+    """
+    az_min = az_min_deg % 360.0
+    az_max = az_max_deg % 360.0
+    if az_max <= az_min:
+        az_max += 360.0
+    return az_min, az_max
+
+
+def _unwrap_deg(az_deg: float, az_min: float) -> float:
+    """Lleva un azimut al espacio desenrollado de un recorte: con az_min=340,
+    el 350 se queda en 350 y el 10 pasa a 370."""
+    return az_deg + 360.0 if az_deg < az_min else az_deg
+
+
+def _crop_profile(az: np.ndarray, elev: np.ndarray, trunc: np.ndarray,
+                  az_min: float, az_max_u: float, step_deg: float):
+    """Rota los arrays para que empiecen en az_min (quedan monótonos en
+    espacio desenrollado) y recorta al sector.
+
+    Rotar en vez de enmascarar es lo que permite que _runs, los polígonos y
+    las bandas de void sigan funcionando sin enterarse del wraparound: un
+    tramo de terreno que cruza el norte, hoy partido en dos por el borde del
+    array, pasa a ser contiguo.
+    """
+    start = int(np.searchsorted(az, az_min))
+    az_u = np.concatenate([az[start:], az[:start] + 360.0])
+    elev = np.concatenate([elev[start:], elev[:start]])
+    trunc = np.concatenate([trunc[start:], trunc[:start]])
+    # margen de una muestra a cada lado para que la silueta llegue pegada al
+    # borde del marco (x_at ya clampa lo que se salga)
+    keep = (az_u >= az_min - step_deg) & (az_u <= az_max_u + step_deg)
+    return az_u[keep], elev[keep], trunc[keep]
+
+
+def _azimuth_ticks(az_min: float, az_max_u: float,
+                   cropped: bool) -> list[tuple[float, str | None]]:
+    """Marcas del eje X en espacio desenrollado, con su etiqueta (o None).
+
+    Los cardinales llevan siempre su letra, comprobando también su copia +360
+    para que el norte aparezca como "N (0°)" en un recorte tipo 340→400. Los
+    ticks no cardinales solo se etiquetan CUANDO HAY RECORTE: así el panorama
+    completo conserva exactamente su aspecto anterior (solo N/E/S/O) y el
+    sector ampliado gana la escala en grados que necesita.
+    """
+    span = az_max_u - az_min
+    for limit, step in ((15.0, 2.0), (30.0, 5.0), (90.0, 10.0),
+                        (180.0, 20.0)):
+        if span <= limit:
+            break
+    else:
+        step = 45.0
+
+    cardinals = {az: name for az, name in _CARDINALS}
+    ticks: list[tuple[float, str | None]] = []
+    first = math.ceil(az_min / step) * step
+    tick = first
+    while tick <= az_max_u + 1e-9:
+        wrapped = tick % 360.0
+        # sin recorte el tick final se rotula "N (360°)" (cierra el círculo,
+        # como venía haciéndose); en un sector desenrollado se rotula "N (0°)"
+        # para que encaje con los ticks siguientes, que ya van en 10°, 20°...
+        shown = wrapped if cropped else tick
+        if wrapped in cardinals:
+            label = f"{cardinals[wrapped]} ({shown:.0f}°)"
+        elif cropped:
+            label = f"{shown:.0f}°"
+        else:
+            label = None
+        ticks.append((tick, label))
+        tick += step
+    return ticks
+
+
 def _place_labels(img: Image.Image, draw: ImageDraw.ImageDraw,
                   peaks: list[PeakSighting], x_at, y_at,
                   band_top: int, band_bottom: int,
                   y_plot: tuple[int, int], font: ImageFont.FreeTypeFont,
-                  s: int) -> LabelReport:
+                  s: int, az_min: float, az_max_u: float) -> LabelReport:
     """Colocación voraz por intervalos: los picos, en orden de prioridad,
     reclaman una ranura horizontal; quien choca con una ya ocupada (siempre
     de mayor prioridad) se descarta entero. Sin desplazamientos: la x de la
@@ -190,10 +300,16 @@ def _place_labels(img: Image.Image, draw: ImageDraw.ImageDraw,
     ordered = sorted(peaks, key=lambda p: (-p.elevation_deg, -p.h_m,
                                            p.distance_m))
     occupied: list[tuple[float, float]] = []
-    placed, discarded = [], []
+    placed, discarded, out_of_range = [], [], []
     for sight in ordered:
-        name = sight.peak.name or f"osm:{sight.peak.osm_id}"
-        x = x_at(sight.azimuth_deg)
+        name = sight.peak.label
+        # el filtro va ANTES de competir por ranura: en un sector estrecho
+        # solo compiten los picos del sector, que es lo que se busca al ampliar
+        az_u = _unwrap_deg(sight.azimuth_deg, az_min)
+        if not az_min <= az_u <= az_max_u:
+            out_of_range.append(name)
+            continue
+        x = x_at(az_u)
         lo, hi = x - slot_w / 2, x + slot_w / 2
         if any(not (hi <= a or lo >= b) for a, b in occupied):
             discarded.append(name)
@@ -217,7 +333,8 @@ def _place_labels(img: Image.Image, draw: ImageDraw.ImageDraw,
 
         _draw_rotated_label(img, text, font, color,
                             int(x), band_bottom, s)
-    return LabelReport(placed=placed, discarded=discarded)
+    return LabelReport(placed=placed, discarded=discarded,
+                       out_of_range=out_of_range)
 
 
 def _label_text(draw: ImageDraw.ImageDraw, name: str, h_m: float,

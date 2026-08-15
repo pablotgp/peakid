@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "photo": "Nerja,_view_from_the_Balcón_de_Europa_to_the_beach__Playa_de_Calahonda_.jpg",
+  "created_utc": "2026-08-15T09:04:52Z",
+  "notes": "",
+  "observer": {
+    "lat_deg": 36.744222,
+    "lon_deg": -3.875444,
+    "eye_m": 9.526415360016195,
+    "source": "cli"
+  },
+  "seed": {
+    "azimuth_deg": {
+      "value": 40.62,
+      "source": "default"
+    },
+    "hfov_deg": {
+      "value": 40.21,
+      "source": "default"
+    },
+    "pitch_deg": {
+      "value": -3.06,
+      "source": "default"
+    },
+    "roll_deg": {
+      "value": -2.05,
+      "source": "default"
+    }
+  },
+  "alignment": {
+    "azimuth_deg": 40.6,
+    "hfov_deg": 40.2,
+    "pitch_deg": -3.05,
+    "roll_deg": -2.05
+  },
+  "image": {
+    "width_px": 2551,
+    "height_px": 1701,
+    "exif_oriented": true
+  }
+}

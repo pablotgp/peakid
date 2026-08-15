@@ -49,6 +49,24 @@ class Peak:
     lon_deg: float
     ele_m: float | None
     wikidata: str | None
+    alt_name: str | None = None   # alt_name / name:es cuando difiere de name
+
+    @property
+    def label(self) -> str:
+        """Nombre para rotular, con el alternativo entre paréntesis.
+
+        En OSM `name` lleva el topónimo LOCAL, que en Asturias, Galicia,
+        Euskadi o Catalunya no es el castellano. El caso que lo destapó: el
+        Naranjo de Bulnes está como `name=Picu Urriellu` con
+        `alt_name=Naranjo de Bulnes`, así que la cima aparecía rotulada con
+        un nombre que el usuario no reconocía y parecía faltar. Se rotulan
+        los dos.
+        """
+        if not self.name:
+            return f"osm:{self.osm_id}"
+        if self.alt_name and self.alt_name != self.name:
+            return f"{self.name} ({self.alt_name})"
+        return self.name
 
 
 @dataclass
@@ -267,13 +285,21 @@ def _overpass_request(query: str) -> dict:
 
 def _parse_node(element: dict) -> Peak:
     tags = element.get("tags", {})
+    name = tags.get("name")
+    # alt_name primero y name:es después: el primero suele traer el nombre
+    # por el que la cima es CONOCIDA fuera de su comarca (Naranjo de Bulnes),
+    # mientras que name:es a menudo es solo la castellanización del local
+    # (Pico Urriellu) y aporta menos.
+    alt = next((tags[k] for k in ("alt_name", "name:es")
+                if tags.get(k) and tags[k] != name), None)
     return Peak(
         osm_id=int(element["id"]),
-        name=tags.get("name"),
+        name=name,
         lat_deg=float(element["lat"]),
         lon_deg=float(element["lon"]),
         ele_m=_parse_ele(tags.get("ele")),
         wikidata=tags.get("wikidata"),
+        alt_name=alt,
     )
 
 

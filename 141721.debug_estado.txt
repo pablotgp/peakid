@@ -1,0 +1,10 @@
+photo=141721.jpg
+params={'azimuth_deg': 16.5, 'hfov_deg': 61.3, 'pitch_deg': 3.3, 'roll_deg': 0.0}
+full=3060x4080
+view_scale=0.148284 fit=0.118627
+view_x=247.83 view_y=387.77
+cw=363 ch=484
+canvas_tk=363x484
+strip_tk=363x200
+patch=(200, 363, 3)
+photo_np=(4080, 3060, 3)
