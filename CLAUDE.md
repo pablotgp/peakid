@@ -44,6 +44,16 @@ no fallan de forma visible.
 - Sufijo obligatorio en los nombres: `azimuth_deg`, `elevation_deg`,
   `lat_rad`. Una variable de ángulo sin sufijo es un bug esperando.
 - Normalizar siempre con `az % 360.0` al devolver un azimut.
+- **AL PORTAR, ese `% 360.0` NO se traduce literalmente.** En Python el resto
+  toma el signo del DIVISOR, así que `-10.0 % 360.0` da `350.0`. En C, C++,
+  Java, Kotlin, Swift, JavaScript y Rust toma el signo del DIVIDENDO y da
+  `-10.0`. La traducción literal produce azimuts NEGATIVOS en todo el
+  cuadrante noroeste, y son plausibles porque las cuentas intermedias siguen
+  saliendo. Medido al portar a Kotlin: el caso dorado 2 está a 336°, que por
+  esa vía sale −24°. Aplica igual al `(x + 180) % 360 - 180` de
+  `destination_point_deg` y de `project_profile`. El puerto usa
+  `normalizeAzimuthDeg` / `wrapDeltaDeg`, y ningún punto suyo usa `% 360.0` a
+  pelo. Ninguno debe.
 
 ## Curvatura terrestre y refracción
 
@@ -105,6 +115,25 @@ numéricamente contra la proyección: recupera pitch a 0.02° y giro a 0.1°.
 - Un arco de sector **mayor de 180° se interpreta como el complementario**
   (el que cruza el norte). Es inequívoco SOLO porque el FOV máximo son 80°:
   si ese tope subiera por encima de 180°, la regla deja de valer.
+- **Límite de salto de la DP: `jump_limit = max(25, 2·banda)`, DESATADO de la
+  banda a propósito.** Son dos mecanismos con trabajos distintos y no deben
+  compartir valor: la **banda** (±2 cuantos alrededor de la frontera del
+  modelo) es la que impide vagar hacia las nubes; el **tope de salto** solo
+  suaviza el camino DENTRO de ella. Atados —`jump_limit = min(25, banda)`—
+  una pared vertical sale en diagonal, porque el camino no puede seguir a la
+  banda cuando es la banda la que salta. Medido con el Naranjo de Bulnes
+  (`Urriellu_desde_el_Pozo_de_La_Oracion.jpg`): el salto máximo quedaba
+  estrangulado en 5 filas, exactamente el tope, con un 2.25% de columnas
+  contra él; desatados sube a 13, en línea con las 15 de la heurística, y la
+  pared del picu sale vertical.
+- Para juzgar un detector hace falta ver la cresta DETECTADA, no solo la
+  silueta proyectada: en la GUI con la tecla **C**, y aislada de toda
+  proyección con `scripts/dump_skyline.py`. Con un mal encaje, la línea
+  proyectada mezcla "el detector se fue a las nubes" con "el azimut está a
+  20°", que son problemas distintos y solo el segundo se arregla desde la
+  ventana. Ambas vistas dibujan **también las columnas descartadas**: un
+  detector con 30% de cobertura parece impecable si solo se pintan las
+  válidas.
 
 ## Ficheros SRTM (.hgt)
 
@@ -195,6 +224,27 @@ Casos (tolerancia ±2% salvo indicación):
 7. Sintético: renderizar el horizonte desde un punto, desplazarlo
    artificialmente +13.7°, y comprobar que el alineamiento recupera
    13.7° ±0.1°. (Implementado y en verde.)
+
+## Qué vigila cada caso, y qué NO
+
+Medido con mutaciones al portar a Kotlin, no deducido. **El convenio de
+`atan2` —el orden de sus argumentos, que es la sospecha número 1 de la lista
+de diagnóstico— lo vigila UN SOLO caso dorado: el 2, por su valor de 336°.**
+
+- El **caso 3 (simetría) NO lo vigila.** Intercambiar los argumentos de
+  `atan2` refleja el azimut al convenio matemático, y la propiedad
+  ida/vuelta = 180° se conserva intacta bajo esa reflexión. El test pasa
+  igual de verde con el convenio girado.
+- El **caso 4 (sentido) TAMPOCO lo vigila.** Solo ejercita
+  `destination_point_deg` y no llama a `azimuth_deg` en ningún momento, así
+  que una mutación en el azimut le es invisible.
+
+Un único guardián para el convenio más peligroso del proyecto es poco. El
+segundo, independiente, es **ida y vuelta**: avanzar con
+`destination_point_deg` a un rumbo conocido y comprobar que `azimuth_deg`
+recupera ese mismo rumbo. Cruza las dos funciones, así que caza el `atan2`
+cambiado Y el `%` de la sección de ángulos. En el puerto está como
+`caso4_idaYVueltaRecuperaElPuntoDePartida`; **falta implementarlo en Python.**
 
 ---
 
@@ -342,7 +392,9 @@ Casi siempre es 1, 2 o 3.
   alrededor de la frontera cruda del modelo. La banda no es un detalle: el
   borde de una nube es tan fuerte como el de una cresta, así que sin acotar
   dónde puede pasar el camino, el término de borde reintroduce exactamente el
-  fallo que el modelo vino a resolver.
+  fallo que el modelo vino a resolver. El **tope de salto** de esa DP va
+  desatado de la banda (ver `## Cámara y alineamiento`): confundirlos
+  estrangula las paredes verticales.
 
 ## Estructura
 
