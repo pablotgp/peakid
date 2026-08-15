@@ -37,5 +37,18 @@
     "width_px": 9248,
     "height_px": 6944,
     "exif_oriented": true
+  },
+  "provenance": {
+    "search_used": true,
+    "auto_pitch_roll": true,
+    "detector": "heuristica",
+    "manual": false,
+    "manual_review": true,
+    "review_delta": {
+      "hfov_deg": -3.78
+    },
+    "review_note": "FOV corregido A MANO de 78.5 a 74.7 grados tras comprobar que las etiquetas no caian sobre las cimas. Correccion con informacion ajena al detector, que es lo que rehabilita la referencia como verdad.",
+    "review_kind": "correccion",
+    "reviewed": true
   }
 }

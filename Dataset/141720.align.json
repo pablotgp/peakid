@@ -37,5 +37,16 @@
     "width_px": 3060,
     "height_px": 4080,
     "exif_oriented": true
+  },
+  "provenance": {
+    "search_used": true,
+    "auto_pitch_roll": true,
+    "detector": "heuristica",
+    "manual": false,
+    "manual_review": true,
+    "review_delta": {},
+    "review_note": "Azimut zanjado comparando TOPONIMOS entre tres candidatos separados 25 grados, no por la metrica de pixeles: el de menor error ponia un cerro de 708 m sobre el macizo dominante y dejaba fuera de cuadro una cima de 2069 m. La revision fue elegir hipotesis, no mover un valor, asi que no hay delta numerico.",
+    "review_kind": "correccion",
+    "reviewed": true
   }
 }

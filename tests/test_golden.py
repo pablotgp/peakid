@@ -1269,6 +1269,270 @@ def test_sector_to_ranges():
     assert fov_lo >= FOV_RANGE_DEG[0] and fov_hi <= FOV_RANGE_DEG[1]
 
 
+def test_dp_prefiere_el_camino_continuo():
+    """El caso cresta→nube→cresta reducido a su esencia.
+
+    Dos "crestas" posibles: una continua a media altura y un atajo por arriba
+    (la nube), localmente más barato en un tramo corto. Sin coste de salto la
+    decisión por columna se va al atajo; subiendo λ, los dos saltos lo hacen
+    inviable y gana el camino continuo.
+
+    Lo que se comprueba es el MECANISMO y que λ lo gobierna, no que la λ de
+    producción rechace cualquier nube: se mantiene deliberadamente permisiva
+    para no aplanar relieve real, y de hecho ya se midió que sobre evidencia
+    de color esto no basta (ver cabecera de skyline.py).
+    """
+    from src.align.skyline import best_path
+
+    height, width = 120, 200
+    cost = np.full((height, width), 1.0)
+    cost[60, :] = 0.30                     # cresta real, continua
+    cost[10, 90:110] = 0.20                # "nube": algo más barata, y corta
+
+    # sin penalización: el ahorro local manda y el camino salta a la nube
+    suelto, _ = best_path(cost, jump_limit=60, smoothness=0.0)
+    assert suelto[100] == 10
+
+    # con penalización suficiente, los dos saltos no compensan
+    rigido, margen = best_path(cost, jump_limit=60, smoothness=3.0)
+    assert np.all(rigido == 60)
+    assert margen.shape == (width,)
+    assert np.all(margen >= 0.0)
+
+
+def test_dp_lambda_controla_el_aplanado():
+    from src.align.skyline import best_path
+
+    height, width = 100, 60
+    rng = np.random.default_rng(0)
+    cost = rng.random((height, width)) * 0.2
+    # un mínimo que serpentea con fuerza de columna a columna
+    serpiente = (50 + 30 * np.sin(np.arange(width) / 3.0)).astype(int)
+    cost[serpiente, np.arange(width)] = 0.0
+
+    suelto, _ = best_path(cost, jump_limit=40, smoothness=0.0)
+    rigido, _ = best_path(cost, jump_limit=40, smoothness=8.0)
+    assert np.abs(np.diff(suelto)).sum() > np.abs(np.diff(rigido)).sum()
+    assert np.abs(np.diff(rigido)).max() <= np.abs(np.diff(suelto)).max()
+
+
+def test_low_confidence_se_guarda_y_se_lee(tmp_path):
+    """Una referencia dudosa tiene que quedar marcada en el JSON: medir
+    contra una referencia mala es peor que no medir."""
+    from src.align import (AlignmentParams, load_session, save_alignment,
+                           seed_entry)
+
+    seed = {n: seed_entry(0.0, "default")
+            for n in ("azimuth_deg", "hfov_deg", "pitch_deg", "roll_deg")}
+    ruta = tmp_path / "x.align.json"
+    save_alignment(str(ruta), "x.jpg",
+                   {"lat_deg": 36.7, "lon_deg": -4.0, "eye_m": 5.0},
+                   seed, AlignmentParams(10.0, 60.0, 0.0, 0.0), 100, 100,
+                   notes="a ojo", low_confidence=True)
+    datos = load_session(str(tmp_path / "x.jpg"))
+    assert datos["low_confidence"] is True
+
+    # por defecto NO es dudosa: marcarla tiene que ser un acto explícito
+    save_alignment(str(ruta), "x.jpg",
+                   {"lat_deg": 36.7, "lon_deg": -4.0, "eye_m": 5.0},
+                   seed, AlignmentParams(10.0, 60.0, 0.0, 0.0), 100, 100)
+    assert load_session(str(tmp_path / "x.jpg"))["low_confidence"] is False
+
+
+def test_detector_sin_onnxruntime_cae_en_heuristica():
+    """La dependencia es OPCIONAL: sin modelo la herramienta sigue teniendo
+    detector, igual que peaks/ sigue funcionando sin red."""
+    from pathlib import Path as _Path
+
+    from src.align.search import detect_photo_skyline
+    from src.align.segmentation import ModelUnavailable, build_model_detector
+
+    inexistente = _Path("models/no_existe_este_modelo.onnx")
+    assert build_model_detector(model_path=inexistente) is detect_photo_skyline
+
+    from src.align.segmentation import load_session
+    with pytest.raises(ModelUnavailable):
+        load_session(inexistente)
+
+    # y el selector rechaza nombres inventados en vez de elegir por su cuenta
+    from src.align.skyline import build_detector
+    with pytest.raises(ValueError):
+        build_detector("dp")          # DP sobre color: descartada, no existe
+
+
+def test_lo_que_descalifica_es_aceptar_sin_revisar_no_usar_la_busqueda():
+    """El criterio que decide si una referencia sirve como VERDAD.
+
+    Un primer intento descartaba toda referencia que hubiera pasado por el
+    buscador, y eso tiraba trabajo humano legítimo: verificar dónde caen los
+    TOPÓNIMOS es información independiente del detector. Lo que no sirve es
+    aceptar la salida del buscador tal cual.
+    """
+    from src.align import provenance_entry
+
+    manual = provenance_entry(detector="modelo+dp")
+    assert manual["manual"] is True and manual["reviewed"] is True
+
+    # aceptada sin revisar: el detector se mediría contra su propia salida
+    cruda = provenance_entry(search_used=True, auto_pitch_roll=True,
+                             detector="heuristica")
+    assert cruda["manual"] is False and cruda["reviewed"] is False
+
+    # misma ayuda automática, pero revisada después: vuelve a servir
+    revisada = provenance_entry(search_used=True, auto_pitch_roll=True,
+                                detector="heuristica", manual_review=True,
+                                review_delta={"hfov_deg": -3.78},
+                                review_note="FOV corregido a mano")
+    assert revisada["manual"] is False      # hubo ayuda, y consta
+    assert revisada["reviewed"] is True     # pero un humano la verificó
+    assert revisada["review_delta"] == {"hfov_deg": -3.78}
+
+
+def test_las_cinco_referencias_constan_como_revisadas():
+    """Las cinco se verificaron a mano contra topónimos después de la
+    búsqueda. Son el único conjunto que hay: descartarlas por haber usado el
+    buscador sería confundir 'usó la ayuda' con 'aceptó la ayuda'."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from src.align import infer_provenance
+
+    rutas = sorted(_Path("Dataset").glob("*.align.json"))
+    if not rutas:
+        pytest.skip("Dataset/ no está en el repo (fotos no versionadas)")
+    for ruta in rutas:
+        datos = _json.loads(ruta.read_text(encoding="utf-8"))
+        origen = infer_provenance(datos)
+        assert origen["reviewed"] is True, f"{ruta.name} no consta revisada"
+        # y consta CÓMO se verificó: sin eso, "revisada" es una afirmación
+        # sin respaldo, que es justo lo que no queremos volver a tener
+        assert origen.get("review_note"), f"{ruta.name} sin review_note"
+
+
+def test_procedencia_no_registrada_no_decide_por_su_cuenta():
+    """Un JSON anterior al campo no se descarta, pero tampoco decide: hay que
+    anotarle a mano cómo se verificó.
+
+    La deducción a partir del seed se probó contra las cinco referencias
+    reales y falla, así que aquí solo puede informar (`hint`).
+    """
+    from src.align import infer_provenance
+
+    # 1) el alignment ES el seed del buscador (caso 20260812 / Nerja)
+    es_seed = {
+        "seed": {"azimuth_deg": {"value": 329.25, "source": "default"},
+                 "hfov_deg": {"value": 63.91, "source": "exif"},
+                 "pitch_deg": {"value": 13.35, "source": "default"},
+                 "roll_deg": {"value": -0.81, "source": "default"}},
+        "alignment": {"azimuth_deg": 329.2, "hfov_deg": 63.9,
+                      "pitch_deg": 13.35, "roll_deg": -0.8}}
+    origen = infer_provenance(es_seed)
+    assert origen["unknown"] is True and origen["reviewed"] is False
+    assert origen["search_used"] is True
+
+    # 2) seed a valores por defecto, búsqueda lanzada desde la GUI: la
+    #    comparación no ve nada y solo las notas lo delatan (caso 141721)
+    desde_gui = {
+        "notes": "alineamiento por busqueda automatica validado a ojo",
+        "seed": {"azimuth_deg": {"value": 0.0, "source": "default"},
+                 "hfov_deg": {"value": 67.38, "source": "exif"},
+                 "pitch_deg": {"value": 0.0, "source": "default"},
+                 "roll_deg": {"value": 0.0, "source": "default"}},
+        "alignment": {"azimuth_deg": 15.4, "hfov_deg": 50.5,
+                      "pitch_deg": 4.0, "roll_deg": 0.2}}
+    origen = infer_provenance(desde_gui)
+    assert origen["unknown"] is True and origen["reviewed"] is False
+
+    # 3) sin indicio ninguno: SIGUE sin decidir. "No hay pruebas de que se
+    #    aceptara a ciegas" no es lo mismo que "consta que se revisó".
+    sin_pistas = {"seed": {}, "alignment": {"azimuth_deg": 51.2}}
+    origen = infer_provenance(sin_pistas)
+    assert origen["unknown"] is True and origen["reviewed"] is False
+
+    # 4) una procedencia DECLARADA manda, y no se marca como deducida
+    declarada = {"provenance": {"search_used": True, "auto_pitch_roll": True,
+                                "detector": "heuristica",
+                                "manual": False, "manual_review": True,
+                                "reviewed": True}}
+    origen = infer_provenance(declarada)
+    assert origen["reviewed"] is True
+    assert origen["unknown"] is False and origen["inferred"] is False
+
+    # 5) un provenance escrito ANTES de existir `reviewed` se completa solo,
+    #    sin que un fichero viejo pierda su condición
+    antiguo = {"provenance": {"search_used": False, "auto_pitch_roll": False,
+                              "detector": None, "manual": True}}
+    assert infer_provenance(antiguo)["reviewed"] is True
+
+
+def test_el_respaldo_al_heuristico_avisa_una_vez(tmp_path, capsys):
+    """Sin la dependencia opcional la herramienta funciona; avisar en cada
+    ejecución sería ruido sobre algo que el usuario no ha elegido."""
+    from src.align.segmentation import announce_fallback
+
+    marca = tmp_path / "aviso"
+    assert announce_fallback("onnxruntime no disponible", marker=marca) is True
+    assert "heurístico" in capsys.readouterr().out
+
+    # la segunda vez se calla, y no imprime NADA
+    assert announce_fallback("onnxruntime no disponible", marker=marca) is False
+    assert capsys.readouterr().out == ""
+
+    # salvo que se pida explícitamente
+    assert announce_fallback("onnxruntime no disponible", verbose=True,
+                             marker=marca) is True
+    assert "heurístico" in capsys.readouterr().out
+
+
+def test_el_defecto_es_el_modelo_con_dp():
+    """El defecto medido, y el respaldo que hace que no cueste nada."""
+    from src.align.skyline import DEFAULT_DETECTOR
+
+    assert DEFAULT_DETECTOR == "modelo+dp"
+
+    import peakid.__main__ as cli
+    parser = cli._build_parser()
+    args = parser.parse_args(["align", "--photo", "x.jpg",
+                              "--lat", "36.7", "--lon", "-4.1"])
+    assert args.skyline_detector == DEFAULT_DETECTOR
+    # y la vía para producir referencias limpias existe y está apagada
+    assert args.no_auto_pitch_roll is False
+
+
+def test_entrada_del_modelo_conserva_el_aspecto():
+    """El cuanto de la máscara es el suelo del error de localización (medido:
+    8.4 px a 512 de entrada, 2.0 px a 1536), así que el tamaño de entrada no
+    es cosmético. Cuadrar la imagen desperdicia resolución en el eje largo."""
+    from src.align.segmentation import SIZE_MULTIPLE, _input_size
+
+    for width, height in ((9248, 6944), (3060, 4080), (2551, 1701)):
+        w, h = _input_size(width, height, 1536)
+        assert w % SIZE_MULTIPLE == 0 and h % SIZE_MULTIPLE == 0
+        assert max(w, h) == 1536              # el lado largo manda
+        # el aspecto se conserva salvo el redondeo a múltiplo de 32
+        assert abs((w / h) - (width / height)) < 0.06
+        # y el eje largo de la entrada es el eje largo de la foto
+        assert (w > h) == (width > height)
+
+
+def test_coste_de_borde_es_relativo_a_cada_columna():
+    """Normalizar por columna, no globalmente: si no, una columna en calima o
+    a contraluz tiene bordes débiles en absoluto y quedaría descartada entera
+    frente a otra bien iluminada, aunque su cresta sea igual de nítida."""
+    from src.align.skyline import edge_cost
+
+    alto, ancho = 60, 8
+    img = np.zeros((alto, ancho, 3), dtype=float)
+    img[30:] = 200.0                       # escalón nítido, columnas 0..3
+    img[30:, 4:] = 8.0                     # mismo escalón, 25 veces más débil
+    coste = edge_cost(img)
+
+    fuerte, debil = coste[29:31, 0].min(), coste[29:31, 4].min()
+    assert fuerte == pytest.approx(debil, abs=1e-6)   # mismo coste pese al
+    assert fuerte < 0.05                              # contraste distinto
+    assert coste[10, 0] > 0.9 and coste[10, 4] > 0.9  # lejos del borde, caro
+
+
 def test_exif_gps_vacio_no_produce_nan():
     """Hay cámaras que escriben el bloque GPS con racionales 0/0 y el
     hemisferio a '\\x00' cuando no llegaron a fijar posición (medido en

@@ -199,10 +199,119 @@ def seed_entry(value: float, source: str) -> dict:
     return {"value": float(value), "source": source}
 
 
+def provenance_entry(search_used: bool = False, auto_pitch_roll: bool = False,
+                     detector: str | None = None,
+                     manual_review: bool = False,
+                     review_delta: dict | None = None,
+                     review_note: str | None = None,
+                     review_kind: str | None = None) -> dict:
+    """Cómo se obtuvo el alineamiento. Decide si sirve como VERDAD.
+
+    LO QUE CONTAMINA NO ES USAR LA BÚSQUEDA, SINO ACEPTARLA SIN REVISAR.
+    Esta distinción costó una vuelta atrás: el primer criterio descartaba
+    toda referencia que hubiera pasado por el buscador, y eso tira a la
+    basura trabajo humano legítimo. Verificar dónde caen los TOPÓNIMOS es
+    información independiente del detector —de hecho es el criterio que
+    CLAUDE.md señala como el que de verdad zanja entre hipótesis—, así que
+    un alineamiento revisado así no hereda el sesgo del detector aunque el
+    punto de partida saliera de él. Casos reales: en `sierra` el FOV se
+    corrigió de 78.5 a 74.7 a mano al ver que las etiquetas no caían sobre
+    las cimas; en `141720` el azimut se zanjó comparando topónimos entre tres
+    candidatos, no por la métrica de píxeles.
+
+    Lo que sí queda inservible como verdad es aceptar la salida del buscador
+    tal cual: ahí el detector se estaría midiendo contra su propia respuesta.
+
+    - `manual`: no intervino ninguna ayuda automática.
+    - `manual_review`: hubo ayuda, pero el usuario la revisó después.
+      `review_delta` guarda cuánto movió cada parámetro, para que quien lea
+      el informe juzgue.
+    - `review_kind`: `"correccion"` si la revisión cambió el resultado,
+      `"verificacion"` si lo dio por bueno sin tocarlo, `None` si no consta.
+      NO se deduce de que `review_delta` esté vacío: en `141720` la revisión
+      corrigió de verdad —cambió de hipótesis entre tres candidatos por los
+      topónimos— y aun así no hay delta numérico, porque no fue mover un
+      valor. Confundir ambas cosas hace afirmaciones falsas sobre el sesgo.
+    - `reviewed`: la conclusión, y lo que mira el arnés.
+    """
+    return {
+        "search_used": bool(search_used),
+        "auto_pitch_roll": bool(auto_pitch_roll),
+        "detector": detector,
+        "manual": not (search_used or auto_pitch_roll),
+        "manual_review": bool(manual_review),
+        "review_delta": review_delta or {},
+        "review_note": review_note,
+        "review_kind": review_kind,
+        # sirve como verdad si nadie automático la tocó, o si un humano la
+        # revisó después con información ajena al detector
+        "reviewed": (not (search_used or auto_pitch_roll)
+                     or bool(manual_review)),
+    }
+
+
+_NOTE_MARKS = ("busqueda automatica", "búsqueda automática", "buscador")
+
+
+def infer_provenance(data: dict, tolerance: float = 0.051) -> dict:
+    """Procedencia de un alineamiento. Deducida si el JSON no trae el campo
+    `provenance`, y en ese caso NUNCA cuenta como revisada.
+
+    La deducción compara `alignment` con `seed`, lo que detecta el caso en que
+    el bloque `seed` ES la salida del buscador, pero se le escapan variantes
+    reales: una semilla del buscador retocada después a mano ya no coincide,
+    y una búsqueda lanzada desde la GUI deja en `seed` los valores previos.
+    Por eso solo informa (`hint`) y no decide.
+
+    Que no decida NO significa que la referencia se descarte: significa que
+    hay que anotar a mano cómo se verificó. Es lo que se hizo con las cinco
+    primeras, todas revisadas contra topónimos.
+    """
+    if isinstance(data.get("provenance"), dict):
+        known = dict(data["provenance"])
+        # compatibilidad con los provenance escritos antes de `reviewed`
+        known.setdefault("manual_review", False)
+        known.setdefault("reviewed",
+                         known.get("manual", False)
+                         or known.get("manual_review", False))
+        return {**known, "inferred": False, "unknown": False}
+
+    alignment = data.get("alignment") or {}
+    seed = data.get("seed") or {}
+    comparables = []
+    for name in ("azimuth_deg", "hfov_deg", "pitch_deg", "roll_deg"):
+        entry, final = seed.get(name), alignment.get(name)
+        if not isinstance(entry, dict) or final is None:
+            comparables = []
+            break
+        if entry.get("source") == "default" and entry.get("value") == 0.0:
+            continue          # un 0 por defecto no coincide, coincide por azar
+        comparables.append(abs(float(entry["value"]) - float(final))
+                           <= tolerance)
+    es_seed = bool(comparables) and all(comparables)
+    notas = (data.get("notes") or "").lower()
+    por_notas = any(marca in notas for marca in _NOTE_MARKS)
+
+    if es_seed:
+        hint = "el alignment ES el seed del buscador"
+    elif por_notas:
+        hint = "las notas mencionan la búsqueda automática"
+    else:
+        hint = "sin indicios, pero tampoco constancia de que sea manual"
+    return {"search_used": es_seed or por_notas,
+            "auto_pitch_roll": es_seed,
+            "detector": None, "manual": False, "manual_review": False,
+            "review_delta": {}, "review_note": None, "review_kind": None,
+            "reviewed": False,
+            "inferred": True, "unknown": True, "hint": hint}
+
+
 def save_alignment(json_path: str, photo_name: str, observer: dict,
                    seed: dict, params: AlignmentParams, width_px: int,
                    height_px: int, notes: str = "",
-                   created_utc: str | None = None) -> None:
+                   created_utc: str | None = None,
+                   low_confidence: bool = False,
+                   provenance: dict | None = None) -> None:
     """Escribe el JSON de alineamiento. `photo_name` debe ser relativo al
     directorio del JSON, para que el par foto+alineamiento se mueva junto."""
     payload = {
@@ -210,6 +319,16 @@ def save_alignment(json_path: str, photo_name: str, observer: dict,
         "photo": photo_name,
         "created_utc": created_utc or _utc_now(),
         "notes": notes,
+        # Procedencia: manual, o tocado por búsqueda/ajuste automático. Sin
+        # esto no se puede saber si una referencia sirve como verdad para
+        # evaluar detectores (ver provenance_entry).
+        "provenance": provenance or provenance_entry(),
+        # Referencia dudosa: el alineamiento existe pero no es fiable como
+        # VERDAD para evaluar detectores (p. ej. hecho a mano porque el
+        # detector automático fallaba en esa misma foto). Medir contra una
+        # referencia mala es peor que no medir: un detector mejor mediría
+        # peor. El arnés la reporta aparte y la excluye del veredicto.
+        "low_confidence": bool(low_confidence),
         "observer": observer,
         "seed": seed,
         "alignment": asdict(params),

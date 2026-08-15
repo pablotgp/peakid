@@ -37,5 +37,16 @@
     "width_px": 2551,
     "height_px": 1701,
     "exif_oriented": true
+  },
+  "provenance": {
+    "search_used": true,
+    "auto_pitch_roll": true,
+    "detector": "heuristica",
+    "manual": false,
+    "manual_review": true,
+    "review_delta": {},
+    "review_note": "Verificada a mano tras la busqueda contrastando los toponimos proyectados con las cimas de la foto. El alignment coincide con la salida del buscador salvo el redondeo: verificada, no modificada.",
+    "review_kind": "verificacion",
+    "reviewed": true
   }
 }

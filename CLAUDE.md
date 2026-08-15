@@ -74,6 +74,38 @@ Distancia: haversine sobre R = 6_371_000 m.
 
     elevation_deg = degrees(atan2(h_B − h_A − drop_m, d_m))
 
+Inclinación y giro a partir del residuo (sostiene `solve_pitch_roll`, la
+etapa gruesa del buscador y el modo automático de la GUI):
+
+    y(pitch, roll) − y(0,0)  ≈  f·tan(pitch) + (x − W/2)·roll_rad
+    con f = (W/2) / tan(hfov/2)
+
+Es decir: el residuo vertical entre la cresta detectada y la línea proyectada
+es una RECTA en x. Su ordenada da la inclinación y su pendiente el giro, así
+que ambos se resuelven en forma cerrada en vez de buscarse. Verificado
+numéricamente contra la proyección: recupera pitch a 0.02° y giro a 0.1°.
+
+## Cámara y alineamiento
+
+- `h_obs_m` es la altitud del **OJO** sobre el nivel del mar, no la cota del
+  suelo. Quien llame suma la altura de la persona (~1.7 m). Pasar la cota
+  hace que las muestras cercanas bloqueen espuriamente.
+- Límites FÍSICOS de cámara: inclinación **±30°**, giro **±15°**. El de
+  inclinación estuvo en 10° y era demasiado estrecho: fotografiar una cima de
+  2500 m desde un valle a 9 km exige mirar 14.5° hacia arriba. El giro sin
+  acotar hacía que la búsqueda devolviera −30°, un grado de libertad falso
+  con el que el ajuste se retuerce hasta encajar ruido.
+- El rayo de visibilidad se detiene **200 m antes del objetivo**: a esa
+  distancia el "terreno" ES la ladera del propio objetivo, y sin ese margen
+  una cima se bloquea a sí misma por centésimas de grado.
+- **Un único origen de píxeles**: `load_oriented_photo` aplica
+  `exif_transpose` UNA vez, y el tamaño se lee DESPUÉS — al rotar 90° se
+  intercambian ancho y alto, y de eso depende toda la proyección. Ninguna
+  otra ruta abre los píxeles de la foto.
+- Un arco de sector **mayor de 180° se interpreta como el complementario**
+  (el que cruza el norte). Es inequívoco SOLO porque el FOV máximo son 80°:
+  si ese tope subiera por encima de 180°, la regla deja de valer.
+
 ## Ficheros SRTM (.hgt)
 
 - SRTM1 (1 arcsec): 3601×3601 valores `int16` BIG-ENDIAN (`>i2`).
@@ -107,6 +139,10 @@ Distancia: haversine sobre R = 6_371_000 m.
 - Consulta: `node["natural"="peak"](around:100000, LAT, LON);`
 - Tags útiles: `name`, `ele`, `wikidata`. `ele` falta a menudo → usar
   la altitud del DEM como respaldo.
+- `name` lleva el topónimo LOCAL, que en Asturias, Galicia, Euskadi o
+  Catalunya no es el castellano. Leer también `alt_name` y `name:es` y
+  rotular ambos: el Naranjo de Bulnes está como `name=Picu Urriellu` con
+  `alt_name=Naranjo de Bulnes`, y parecía faltar de la lista.
 - Las coordenadas de OSM están puestas a ojo y pueden desviarse decenas
   de metros. Antes de comprobar visibilidad, RECOLOCAR cada pico en el
   punto más alto del DEM dentro de un radio de 200 m.
@@ -145,15 +181,20 @@ Casos (tolerancia ±2% salvo indicación):
 4. Sentido: avanzar con azimut 0° aumenta la latitud y deja la
    longitud casi igual. Con 90°, aumenta la longitud.
 
-5. DEM: la altitud leída en (40.8508, −3.9578) está entre 2400 y 2430.
+5. DEM: la altitud en (40.8508, −3.9578) está entre 2400 y 2430.
    Si sale ~800, las filas están invertidas.
+   Se mide TRAS RECOLOCAR al máximo del DEM dentro de 200 m, igual que hace
+   el motor con toda coordenada de cima: esa coordenada (de Wikipedia) queda
+   a 175 m de la cumbre real, y leída literalmente da 2391.2 m — 37 m por
+   debajo de los 2428 oficiales — frente a 2424.2 recolocada, déficit de
+   solo 4 m, coherente con el sesgo conocido de SRTM.
 
 6. Visibilidad: desde el Peñalara, la Bola del Mundo (40.7906,
    −3.9553, 2265 m) es visible. Están a ~7 km sin obstáculos.
 
-7. Sintético (cuando exista el alineamiento): renderizar el horizonte
-   desde un punto, desplazarlo artificialmente +13.7°, y comprobar que
-   el alineamiento recupera 13.7° ±0.1°.
+7. Sintético: renderizar el horizonte desde un punto, desplazarlo
+   artificialmente +13.7°, y comprobar que el alineamiento recupera
+   13.7° ±0.1°. (Implementado y en verde.)
 
 ---
 
@@ -180,13 +221,128 @@ Cuando un resultado salga raro, el orden de sospecha es:
 
 Casi siempre es 1, 2 o 3.
 
+## Trampas de medición (sufridas, no teóricas)
+
+- La métrica de error del buscador **recorta cada residuo a 40 px y satura**.
+  Un desajuste de 350 px da el mismo número que uno de 45, así que un error
+  cercano al tope NO significa "casi bueno" sino "sin medir". Mirar siempre
+  `saturated_fraction` antes de interpretar un error.
+- El error en píxeles ordena candidatos **dentro de una hipótesis, no entre
+  hipótesis**. La comprobación de ambigüedad contrasta el mejor contra UN
+  alternativo lejano y no cubre un continuo de óptimos parecidos. Para elegir
+  entre hipótesis hay que mirar los **topónimos**: qué cima cae sobre qué
+  bulto y con qué altitud. Medido: tres candidatos separados 25° con errores
+  decrecientes, y el de MENOR error ponía un cerro de 708 m sobre el macizo
+  dominante y dejaba fuera de cuadro una cima de 2069 m.
+- Una referencia de alineamiento dudosa NO puede usarse como verdad para
+  evaluar detectores: se marca `low_confidence` y queda fuera del criterio.
+  Medir contra una referencia mala es peor que no medir, porque un detector
+  mejor mediría peor.
+- **Lo que descalifica una referencia no es haber USADO la búsqueda, sino
+  haberla ACEPTADO SIN REVISAR.** Esta distinción costó una vuelta atrás: el
+  primer criterio descartaba toda referencia que hubiera pasado por el
+  buscador, y eso tira trabajo humano legítimo. Verificar dónde caen los
+  TOPÓNIMOS es información independiente del detector —es el criterio que
+  esta misma sección señala como el que zanja entre hipótesis—, así que una
+  referencia revisada así no hereda el sesgo aunque partiera de él. Lo que sí
+  queda inservible es la salida del buscador tomada tal cual: ahí el detector
+  se mide contra su propia respuesta.
+- Cada alineamiento guarda un bloque **`provenance`**: `search_used`,
+  `auto_pitch_roll`, `detector`, `manual`, `manual_review`, `review_delta`,
+  `review_note`, `review_kind` y la conclusión `reviewed`. `review_kind`
+  (`correccion` / `verificacion`) se DECLARA, no se deduce de que
+  `review_delta` esté vacío: en `141720` la revisión corrigió de verdad
+  —cambió de hipótesis entre candidatos por los topónimos— y aun así no dejó
+  delta numérico. **Solo las `reviewed` deciden** en
+  `scripts/eval_skyline.py`, que separa "revisadas" de "aceptadas sin
+  revisar". La GUI marca `manual_review` sola: registra qué parámetros movió
+  la persona DESPUÉS de la ayuda automática y cuánto (los cambios del ajuste
+  cerrado de pitch/roll no cuentan, porque no pasan por la mano).
+- Las cinco referencias de `Dataset/` constan como **revisadas**, con nota de
+  cómo se verificó cada una. Dos niveles, y conviene no confundirlos:
+  - **revisadas con corrección**: `sierra` (FOV corregido a mano de 78.5 a
+    74.7 al ver que las etiquetas no caían sobre las cimas) y `141720` (azimut
+    zanjado comparando topónimos entre tres candidatos, no por la métrica).
+  - **verificadas sin corrección**: `141721`, `20260812` y `Nerja`. Se
+    contrastaron los topónimos y se dieron por buenas sin mover ningún valor.
+- **LAS CINCO REFERENCIAS ACTUALES TIENEN SU ORIGEN EN LA HEURÍSTICA**: el
+  punto de partida de todas lo produjo la búsqueda automática con ese
+  detector. La revisión humana las valida como verdad —por eso deciden—, pero
+  **el residuo en píxeles sigue favoreciéndolo por construcción**, sobre todo
+  en las tres de `review_kind: verificacion`, donde los valores son
+  literalmente los que el buscador propuso. Consecuencia práctica: una
+  diferencia de residuo del orden de 1 px en contra de otro detector NO es
+  evidencia de que sea peor. Lo que sí es comparable hoy: el error de azimut
+  de punta a punta (`search_alignment` reajusta todo) y lo que no depende de
+  referencia — cobertura, dispersión de filas e inspección visual.
+  **Cuando haya referencias nacidas sin búsqueda, el residuo en píxeles
+  volverá a ser una métrica comparable entre detectores.**
+- **Un JSON sin `provenance` no decide por su cuenta**, pero tampoco se
+  descarta: hay que anotarle la revisión. Deducir la procedencia comparando
+  `alignment` con `seed` se probó y **falla**: con una sola magnitud
+  comparable el criterio degenera (`141720`), y en `sierra` hubo tres
+  correcciones simultáneas, que es justo lo que una regla de "casi todo
+  coincide" descarta. La deducción solo informa.
+- Para una referencia sin ninguna ayuda automática:
+  `peakid align --no-auto-pitch-roll`, sin `--search` y sin pulsar S.
+
 ## Stack
 
 - Python 3.11+
 - Permitido: `numpy`, `pillow`, `requests`, `pytest`
 - NO usar: GDAL, rasterio, pyproj, geopy. Las fórmulas se implementan
   a mano — son cinco líneas y así quedan bajo el control de los tests.
+- `onnxruntime`: dependencia **OPCIONAL**, ya adoptada para segmentación de
+  cielo. Sin ella el motor no revienta — `build_model_detector` devuelve el
+  detector heurístico y lo dice. 14.1 MB (Win) / 19.2 MB (Linux) frente a
+  torch 122.3 MB / 526.6 MB. **torch nunca como dependencia de ejecución**:
+  el `.onnx` se obtiene una vez aparte y aquí solo se ejecuta.
+  En Windows requiere el **Visual C++ Redistributable** (`msvcp140.dll`);
+  Python solo trae `vcruntime140*`, así que sin él el import falla con
+  `DLL load failed` — se captura como `ModelUnavailable`.
 - Sin type checker estricto, pero sí type hints en las firmas públicas.
+
+## Segmentación de cielo (modelo)
+
+- **El detector por defecto es `modelo+dp`, y depende de una dependencia
+  OPCIONAL.** Es una excepción deliberada a la regla de que el motor funcione
+  con solo `numpy`+`pillow`, y se sostiene sobre dos cosas: lo medido y el
+  respaldo. Medido, frente a la heurística:
+
+      foto                    heurística      modelo+dp
+      141720.jpg              1.5 px, cob 51%   2.5 px, cob 100%
+      141721.jpg              2.2 px, cob 96%   2.5 px, cob 100%
+      20260812_104438.jpg     2.2 px, cob 99%   2.8 px, cob 100%
+      Nerja                   1.9 px, cob 100%  2.3 px, cob 100%
+      sierra.jpg             31.3 px, cob 98%  26.2 px, cob 100%
+      IMG_20240210_122140    desv 1070 px       desv 232 px, cob 100%
+
+  Gana en cobertura en las seis, arregla la de cielo cubierto (donde la
+  heurística se engancha a los bordes de nube) y empata en error de azimut
+  (≤0.25° en todas). Los déficits de 0.3–1.0 px se miden contra referencias
+  cuyo punto de partida lo produjo la propia heurística: son revisadas y
+  válidas, pero un sesgo residual a su favor a escala de píxel es esperable
+  (ver `## Trampas de medición`).
+- **El respaldo es lo que hace legítimo ese defecto**: sin `onnxruntime` o sin
+  el `.onnx` se usa la heurística y la herramienta funciona igual. El aviso
+  se da **una sola vez por máquina** (marca en `~/.peakid/`) o con
+  `--verbose`: quien no tenga la dependencia no ha elegido nada y no le falta
+  nada, así que un aviso en cada ejecución sería ruido.
+- Modelo: **SegFormer-B0 finetuneado en ADE20K**, clase `sky` = **2**. 15.3 MB
+  en `models/`, NO versionado (como los `.hgt`). Ojo: el DeepLabV3+ de
+  torchvision es COCO/VOC-21 y **no tiene clase cielo**.
+- El grafo ONNX tiene alto y ancho **dinámicos**, y eso importa: saca los
+  logits a **1/4 de la entrada**, y ese cuanto es el suelo del error de
+  localización. Medido, el residuo lo sigue: 8.4 px con entrada 512, 2.0 px
+  con 1536, y 2048 no mejora y triplica el tiempo. **1536 en el lado largo,
+  conservando la relación de aspecto** y en múltiplos de 32.
+- El modelo dice QUÉ es cielo pero no con qué fila exacta; el gradiente de la
+  imagen dice la fila pero no sabe qué es una nube. Se combinan: DP sobre
+  `región(modelo) + 0.3·borde(imagen)`, **acotada a una banda de ±2 cuantos**
+  alrededor de la frontera cruda del modelo. La banda no es un detalle: el
+  borde de una nube es tan fuerte como el de una cresta, así que sin acotar
+  dónde puede pasar el camino, el término de borde reintroduce exactamente el
+  fallo que el modelo vino a resolver.
 
 ## Estructura
 
@@ -195,6 +351,7 @@ Casi siempre es 1, 2 o 3.
     src/horizon/  rayos, visibilidad, barrido de 360°
     src/peaks/    Overpass, recolocación, filtrado
     src/render/   PNG del perfil del horizonte
+    src/align/    alineamiento foto↔horizonte, detectores de cresta
 
 ## Roles de cada fuente de datos
 
@@ -213,5 +370,20 @@ Soportar múltiples fuentes de DEM con resoluciones distintas, con
 prioridad a la más fina. Los Dolomitas tienen LiDAR abierto a 1-2 m
 (Bolzano/Trento) que no sigue el formato de tile 1°x1°. SRTM queda
 como respaldo global.
+
+## Margen de cima
+
+SUMMIT_MARGIN_M = 200. El rayo deja de comprobar obstáculos en los
+últimos 200 m antes del objetivo. Mismo valor que el radio de
+recolocación de peaks/, y por la misma razón: a esa distancia el
+"terreno" y el objetivo son el mismo accidente geográfico.
+
+Sin esto se produce AUTO-BLOQUEO: la ladera final del propio pico,
+rendida por SRTM ligeramente por debajo de la cota oficial pero un
+poco más cerca del observador, gana el ángulo por centésimas y tapa
+su propia cima. Medido: Cima de Tejeda salía BLOCKED por terreno de
+2068.3 m situado a 13 m de la cima oficial de 2069.
+
+NO bajar este valor sin reproducir el test dorado de PeakFinder.
 
 `geo/` no depende de nadie. Todo lo demás depende de `geo/`.

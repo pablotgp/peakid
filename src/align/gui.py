@@ -43,6 +43,7 @@ from src.align import (
     build_strip,
     load_oriented_photo,
     project_profile,
+    provenance_entry,
     save_alignment,
     seed_entry,
 )
@@ -73,7 +74,9 @@ def run_align(photo_path: str, profile: HorizonProfile, lat_deg: float,
               lon_deg: float, eye_m: float, seed_params: AlignmentParams,
               seed_sources: dict[str, str], observer_source: str,
               resume: dict | None = None, peaks: list | None = None,
-              ) -> str | None:
+              detector=None, detector_name: str | None = None,
+              search_used: bool = False,
+              auto_pitch_roll: bool = True) -> str | None:
     """Abre la ventana; devuelve la ruta del JSON si se guardó, None si no.
 
     `resume` es la sesión anterior (el dict de load_session) si existe: los
@@ -81,10 +84,15 @@ def run_align(photo_path: str, profile: HorizonProfile, lat_deg: float,
     `seed` original se conserva TAL CUAL al reguardar — la procedencia EXIF
     de la primera vez es la medida del error de brújula y una recarga no
     debe sobrescribirla.
+
+    `search_used` viene a True si la CLI ya precargó un resultado de búsqueda
+    automática: eso contamina la referencia igual que pulsar S aquí dentro, y
+    tiene que quedar anotado aunque el usuario no toque nada más.
     """
     app = _AlignApp(photo_path, profile, lat_deg, lon_deg, eye_m,
                     seed_params, seed_sources, observer_source, resume,
-                    peaks)
+                    peaks, detector, detector_name, search_used,
+                    auto_pitch_roll)
     app.root.mainloop()
     return app.saved_path
 
@@ -92,7 +100,8 @@ def run_align(photo_path: str, profile: HorizonProfile, lat_deg: float,
 class _AlignApp:
     def __init__(self, photo_path, profile, lat_deg, lon_deg, eye_m,
                  seed_params, seed_sources, observer_source, resume=None,
-                 peaks=None):
+                 peaks=None, detector=None, detector_name=None,
+                 search_used=False, auto_pitch_roll=True):
         self.photo_path = photo_path
         self.profile = profile
         self.lat_deg, self.lon_deg, self.eye_m = lat_deg, lon_deg, eye_m
@@ -108,11 +117,28 @@ class _AlignApp:
         self.img, self.photo_np = load_oriented_photo(photo_path)
         self.full_w, self.full_h = self.img.size
 
+        # PROCEDENCIA: qué ayudas automáticas han tocado este alineamiento.
+        # Se arrastra durante toda la sesión y se guarda, porque de ello
+        # depende si la referencia sirve como verdad para evaluar detectores.
+        self.detector_name = detector_name
+        self.used_search = bool(search_used)
+        self.used_auto_pitch_roll = False
+        # Revisión humana POSTERIOR a la ayuda automática: es lo que
+        # rehabilita una referencia como verdad. Se guarda el estado justo
+        # después de aceptar la búsqueda y se compara al guardar.
+        self._auto_snapshot = (vars(seed_params).copy() if search_used
+                               else None)
+        self._user_edited: set[str] = set()
+        # Arrancar con el ajuste cerrado DESMARCADO es lo que hace falta para
+        # producir una referencia limpia: mientras esté activo, pitch y roll
+        # salen del detector y la referencia queda contaminada.
+        self.auto_pitch_roll_default = bool(auto_pitch_roll)
+
         # cresta de la foto: se detecta UNA vez y alimenta el modo automático
-        # de pitch/roll. Es la heurística asistente de search.py, no el
-        # detector engañoso que se quitó en su día: aquí no muestra un número
-        # de calidad, resuelve dos parámetros que el usuario puede congelar.
-        cols, rows, valid = detect_photo_skyline(self.photo_np)
+        # de pitch/roll. Es una ayuda al etiquetado, no un veredicto: aquí no
+        # muestra un número de calidad, resuelve dos parámetros que el usuario
+        # puede congelar.
+        cols, rows, valid = (detector or detect_photo_skyline)(self.photo_np)
         self.skyline_cols = cols[valid]
         self.skyline_rows = rows[valid]
         self.has_skyline = self.skyline_cols.size >= _MIN_SKYLINE_COLUMNS
@@ -147,8 +173,10 @@ class _AlignApp:
         # la banda en vez de dejar que se salgan del lienzo
         self._label_font = tkfont.Font(family="TkDefaultFont", size=8)
         self._build_controls()
-        if resume is not None and resume.get("notes"):
-            self.notes.insert(0, resume["notes"])
+        if resume is not None:
+            if resume.get("notes"):
+                self.notes.insert(0, resume["notes"])
+            self.low_confidence.set(bool(resume.get("low_confidence")))
 
         # la foto se escala a lo que sobra en pantalla DESPUÉS de reservar
         # controles, tira y panel de sector
@@ -215,7 +243,7 @@ class _AlignApp:
             # pitch y roll se resuelven solos; sus casillas permiten
             # congelarlos para retoque manual
             if name in ("pitch_deg", "roll_deg"):
-                var = tk.BooleanVar(value=True)
+                var = tk.BooleanVar(value=self.auto_pitch_roll_default)
                 self.auto_vars[name] = var
                 tk.Checkbutton(self.controls, text="auto", variable=var,
                                command=self._on_auto_toggle).grid(
@@ -229,7 +257,14 @@ class _AlignApp:
         tk.Label(self.controls, text="notes", width=17, anchor="w").grid(
             row=2, column=0, sticky="w")
         self.notes = tk.Entry(self.controls)
-        self.notes.grid(row=2, column=1, columnspan=5, sticky="we")
+        self.notes.grid(row=2, column=1, columnspan=4, sticky="we")
+        # marcar la referencia como dudosa al guardar, sin editar el JSON a
+        # mano: si este alineamiento no sirve como verdad para evaluar
+        # detectores, hay que decirlo aquí
+        self.low_confidence = tk.BooleanVar(value=False)
+        tk.Checkbutton(self.controls, text="referencia dudosa",
+                       variable=self.low_confidence).grid(
+            row=2, column=5, sticky="w", padx=(6, 0))
         # Lectura del ajuste automático en su PROPIA etiqueta, no en la barra
         # de estado: se recalcula en cada redibujado y se comía los mensajes
         # de la búsqueda y de las teclas de candidato, que son respuestas a
@@ -470,6 +505,10 @@ class _AlignApp:
         if value == getattr(self.params, name):
             return
         setattr(self.params, name, value)
+        # ÚNICO punto por el que pasa un cambio hecho por la persona: los
+        # cambios del código van por _apply_value con el guard puesto. Por eso
+        # el ajuste automático de pitch/roll NO se cuenta como revisión.
+        self._user_edited.add(name)
         self._redraw()
 
     def _apply_value(self, name: str, value: float) -> None:
@@ -627,6 +666,9 @@ class _AlignApp:
         for name, value in (("pitch_deg", solved[0]), ("roll_deg", solved[1])):
             if self.auto_vars[name].get():
                 self._apply_value(name, value)
+                # queda anotado para siempre: aunque luego se desmarque la
+                # casilla, este valor ya salió del detector
+                self.used_auto_pitch_roll = True
         self.auto_label.config(
             fg="#2e7d32",
             text=f"auto: pitch {self.params.pitch_deg:+.2f}°  "
@@ -792,6 +834,12 @@ class _AlignApp:
                      f"(1..{len(self.candidates)})")
             return
         chosen = self.candidates[index]
+        self.used_search = True
+        # a partir de aquí, lo que el usuario mueva ES la revisión: saltar
+        # entre candidatos comparando topónimos y quedarse con uno también
+        # cuenta, y por eso el snapshot se rehace en cada salto
+        self._auto_snapshot = vars(chosen.params).copy()
+        self._user_edited.clear()
         for name in ("azimuth_deg", "hfov_deg", "pitch_deg", "roll_deg"):
             value = getattr(chosen.params, name)
             slider = self.sliders[name]
@@ -937,6 +985,27 @@ class _AlignApp:
 
     # --- guardado -----------------------------------------------------
 
+    def _review_delta(self) -> dict:
+        """Cuánto movió la persona cada parámetro después de la ayuda
+        automática. Se guarda el CUÁNTO, no solo el sí/no: un ajuste de 3.8°
+        de FOV es una corrección de verdad y un roce de 0.05° puede ser un
+        resbalón del ratón, y quien lea el informe debe poder distinguirlos.
+        """
+        if not self._auto_snapshot or not self._user_edited:
+            return {}
+        delta = {}
+        for name in sorted(self._user_edited):
+            antes = self._auto_snapshot.get(name)
+            if antes is None:
+                continue
+            ahora = getattr(self.params, name)
+            if name == "azimuth_deg":
+                diff = (ahora - antes + 180.0) % 360.0 - 180.0
+            else:
+                diff = ahora - antes
+            delta[name] = round(float(diff), 4)
+        return delta
+
     def _save(self) -> None:
         json_path = alignment_json_path(self.photo_path)
         if self.resume is not None and "seed" in self.resume:
@@ -950,9 +1019,30 @@ class _AlignApp:
                                  "roll_deg")}
         observer = {"lat_deg": self.lat_deg, "lon_deg": self.lon_deg,
                     "eye_m": self.eye_m, "source": self.observer_source}
+        # Al reanudar, tanto la ayuda automática como la revisión se HEREDAN:
+        # una sesión anterior que ya verificó los topónimos no deja de haberlo
+        # hecho porque hoy se reabra el fichero.
+        previa = (self.resume or {}).get("provenance") or {}
         save_alignment(str(json_path), Path(self.photo_path).name, observer,
                        seed, self.params, self.full_w, self.full_h,
-                       notes=self.notes.get())
+                       notes=self.notes.get(),
+                       low_confidence=self.low_confidence.get(),
+                       provenance=provenance_entry(
+                           search_used=self.used_search
+                           or bool(previa.get("search_used")),
+                           auto_pitch_roll=self.used_auto_pitch_roll
+                           or bool(previa.get("auto_pitch_roll")),
+                           detector=self.detector_name
+                           or previa.get("detector"),
+                           manual_review=bool(self._user_edited)
+                           or bool(previa.get("manual_review")),
+                           review_delta=self._review_delta()
+                           or previa.get("review_delta"),
+                           review_note=previa.get("review_note"),
+                           # aquí sí se deduce, y es correcto: en la GUI la
+                           # única forma de revisar es mover un slider
+                           review_kind=("correccion" if self._user_edited
+                                        else previa.get("review_kind"))))
         self.saved_path = str(json_path)
         self.root.destroy()
 

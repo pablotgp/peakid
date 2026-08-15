@@ -3,3 +3,6 @@ __pycache__/
 data/*.hgt
 *.png
 cache/
+# pesos del modelo de segmentacion: 15 MB, se descargan aparte igual que los
+# tiles .hgt (ver src/align/segmentation.py)
+models/

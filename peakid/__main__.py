@@ -103,6 +103,21 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="directorio de caché de Overpass")
     align.add_argument("--no-peaks", action="store_true",
                        help="no cargar topónimos (útil sin red y sin caché)")
+    align.add_argument("--skyline-detector", default="modelo+dp",
+                       choices=("heuristica", "modelo", "modelo+dp"),
+                       help="detector de cresta: modelo con camino global por "
+                            "programación dinámica (por defecto), modelo a "
+                            "secas, o la heurística de color. Sin onnxruntime "
+                            "o sin el .onnx se usa la heurística sin más")
+    align.add_argument("--verbose", action="store_true",
+                       help="informa de decisiones que normalmente se callan, "
+                            "como el respaldo al detector heurístico")
+    align.add_argument("--no-auto-pitch-roll", action="store_true",
+                       help="abre con el ajuste automático de inclinación y "
+                            "giro DESMARCADO. Necesario para producir una "
+                            "referencia limpia: con él activo, pitch y roll "
+                            "salen del detector y la referencia ya no sirve "
+                            "para evaluar detectores")
     align.set_defaults(handler=_cmd_align_photo)
 
     peaks = sub.add_parser(
@@ -265,21 +280,33 @@ def _cmd_align_photo(args: argparse.Namespace) -> int:
         print("semillas: " + "  ".join(
             f"{n}={seeds[n]:.1f} ({sources[n]})" for n in seeds))
 
+    # El detector se construye UNA vez y se comparte con la GUI: dos llamadas
+    # cargarían el modelo dos veces y podrían avisar dos veces del respaldo.
+    from src.align.skyline import DEFAULT_DETECTOR, build_detector
+    detector_name = getattr(args, "skyline_detector", DEFAULT_DETECTOR)
+    detector = build_detector(detector_name,
+                              verbose=getattr(args, "verbose", False))
+
+    search_used = False
     if getattr(args, "search", False):
         # asistente de fuerza bruta: precarga la GUI cerca, el usuario juzga
         az_source = ("sesión" if session is not None
                      else sources.get("azimuth_deg", "default"))
         found = _search_alignment(args, args.photo, profile, initial,
-                                  az_source)
+                                  az_source, detector=detector)
         if found is not None:
             initial = found
+            search_used = True      # queda anotado en la procedencia
 
     sightings = _peaks_for_align(args, lat_deg, lon_deg, eye_m)
 
     from src.align.gui import run_align  # import tardío: tkinter solo aquí
     saved = run_align(args.photo, profile, lat_deg, lon_deg, eye_m,
                       initial, sources, obs_source, resume=session,
-                      peaks=sightings)
+                      peaks=sightings, detector=detector,
+                      detector_name=detector_name, search_used=search_used,
+                      auto_pitch_roll=not getattr(
+                          args, "no_auto_pitch_roll", False))
     if saved is None:
         print("cerrado sin guardar")
     else:
@@ -309,15 +336,21 @@ def _peaks_for_align(args, lat_deg, lon_deg, eye_m):
         return []
 
 
-def _search_alignment(args, photo_path, profile, initial, az_source="default"):
-    """Búsqueda automática (heurística asistente, NO la fase 2): detecta la
-    cresta con un filtro clásico y busca por fuerza bruta los parámetros que
-    la encajan con el perfil. El resultado se valida SIEMPRE a mano."""
+def _search_alignment(args, photo_path, profile, initial, az_source="default",
+                      detector=None):
+    """Búsqueda automática (asistente, NO la fase 2): detecta la cresta y
+    busca por fuerza bruta los parámetros que la encajan con el perfil. El
+    resultado se valida SIEMPRE a mano."""
     from src.align import load_oriented_photo
-    from src.align.search import detect_photo_skyline, search_alignment
+    from src.align.search import search_alignment
 
+    from src.align.skyline import DEFAULT_DETECTOR, build_detector
     img, photo_np = load_oriented_photo(photo_path)
-    cols, rows, valid = detect_photo_skyline(photo_np)
+    if detector is None:
+        detector = build_detector(
+            getattr(args, "skyline_detector", DEFAULT_DETECTOR),
+            verbose=getattr(args, "verbose", False))
+    cols, rows, valid = detector(photo_np)
     if valid.sum() < 50:
         print("búsqueda: cresta no detectable (calima, contraluz o primer "
               "plano) — se abre con los valores iniciales")

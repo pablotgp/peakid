@@ -37,5 +37,16 @@
     "width_px": 3060,
     "height_px": 4080,
     "exif_oriented": true
+  },
+  "provenance": {
+    "search_used": true,
+    "auto_pitch_roll": true,
+    "detector": "heuristica",
+    "manual": false,
+    "manual_review": true,
+    "review_delta": {},
+    "review_note": "Resultado de la busqueda validado a ojo contra el terreno, segun las notas de la propia captura. No consta que se modificara ningun parametro.",
+    "review_kind": "verificacion",
+    "reviewed": true
   }
 }
