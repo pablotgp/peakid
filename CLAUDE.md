@@ -227,24 +227,35 @@ Casos (tolerancia ±2% salvo indicación):
 
 ## Qué vigila cada caso, y qué NO
 
-Medido con mutaciones al portar a Kotlin, no deducido. **El convenio de
-`atan2` —el orden de sus argumentos, que es la sospecha número 1 de la lista
-de diagnóstico— lo vigila UN SOLO caso dorado: el 2, por su valor de 336°.**
+Medido con mutaciones (`atan2` con los argumentos intercambiados sobre
+`azimuth_deg`), no deducido. En Python caen 10 tests y el convenio queda bien
+cubierto: `test_sol_penalara_azimut` (caso 2, por su valor de 336°),
+`test_sentido` (caso 4: sale 90.0 donde esperaba 0.0),
+`test_destino_ida_y_vuelta` y las tres de la validación contra PeakFinder.
+No falta ningún guardián.
 
-- El **caso 3 (simetría) NO lo vigila.** Intercambiar los argumentos de
-  `atan2` refleja el azimut al convenio matemático, y la propiedad
-  ida/vuelta = 180° se conserva intacta bajo esa reflexión. El test pasa
-  igual de verde con el convenio girado.
-- El **caso 4 (sentido) TAMPOCO lo vigila.** Solo ejercita
-  `destination_point_deg` y no llama a `azimuth_deg` en ningún momento, así
-  que una mutación en el azimut le es invisible.
+Lo que sí conviene tener escrito, porque no es evidente:
 
-Un único guardián para el convenio más peligroso del proyecto es poco. El
-segundo, independiente, es **ida y vuelta**: avanzar con
-`destination_point_deg` a un rumbo conocido y comprobar que `azimuth_deg`
-recupera ese mismo rumbo. Cruza las dos funciones, así que caza el `atan2`
-cambiado Y el `%` de la sección de ángulos. En el puerto está como
-`caso4_idaYVueltaRecuperaElPuntoDePartida`; **falta implementarlo en Python.**
+- El **caso 3 (simetría) NO vigila el convenio.** Intercambiar los argumentos
+  de `atan2` refleja el azimut al convenio matemático, y la propiedad
+  ida/vuelta = 180° se conserva intacta bajo esa reflexión. Pasa igual de
+  verde con el convenio girado, así que no puede ser la única comprobación.
+- El **caso 4 tiene DOS lecturas y hacen falta las dos.** `test_sentido`
+  comprueba el AZIMUT hacia rumbos cardinales y sí caza la mutación;
+  `test_destino_sentido` comprueba que avanzar con un rumbo mueve la
+  coordenada en el sentido correcto, y NO la caza, porque no llama a
+  `azimuth_deg` en ningún momento.
+
+**Trampa al portar, sufrida.** El puerto a Kotlin implementó el caso 4 solo en
+su lectura de `destination_point` y perdió ese guardián sin que nada avisara:
+los tests seguían verdes y el caso figuraba como cubierto. El enunciado del
+contrato —"avanzar con azimut 0° aumenta la latitud"— sugiere solo esa mitad,
+así que un puerto fiel al TEXTO pierde la otra. **Al portar, portar contra los
+tests, no contra el enunciado**, y comprobar con una mutación que el caso
+portado caza lo que cazaba el original.
+
+`test_destino_ida_y_vuelta` es el tercer guardián y cruza las dos funciones,
+así que caza el `atan2` cambiado Y el `%` de la sección de ángulos.
 
 ---
 
